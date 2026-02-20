@@ -225,6 +225,8 @@ export default function Home() {
   const [fontMode, setFontMode] = useState<FontMode>("sans");
   const [isCancelling, setIsCancelling] = useState(false);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [downloadedBytes, setDownloadedBytes] = useState<number | null>(null);
+  const [totalBytes, setTotalBytes] = useState<number | null>(null);
 
   const clearProgressState = useCallback(() => {
     setProgress(0);
@@ -232,6 +234,8 @@ export default function Home() {
     setProcessedChunks(null);
     setTotalChunks(null);
     setEtaSeconds(null);
+    setDownloadedBytes(null);
+    setTotalBytes(null);
     transcribeStartedAtRef.current = null;
   }, []);
 
@@ -285,6 +289,8 @@ export default function Home() {
           setTotalChunks(null);
           setEtaSeconds(null);
           transcribeStartedAtRef.current = null;
+          if (typeof message.loaded === "number") setDownloadedBytes(message.loaded);
+          if (typeof message.total === "number" && message.total > 0) setTotalBytes(message.total);
           return;
         }
 
@@ -659,16 +665,21 @@ export default function Home() {
 
   const progressLabel = useMemo(() => {
     if (progressPhase === "download") {
-      return `Downloading model assets... ${progress.toFixed(0)}%`;
+      if (downloadedBytes !== null && totalBytes !== null && totalBytes > 0) {
+        const dlMB = (downloadedBytes / (1024 * 1024)).toFixed(1);
+        const totalMB = (totalBytes / (1024 * 1024)).toFixed(1);
+        return `Downloading model... ${dlMB} MB / ${totalMB} MB (${progress.toFixed(0)}%)`;
+      }
+      return `Downloading model... ${progress.toFixed(0)}%`;
     }
     if (progressPhase === "transcribing") {
       if (processedChunks !== null && totalChunks !== null) {
-        return `Transcribing chunks... ${progress.toFixed(0)}% (${processedChunks}/${totalChunks})`;
+        return `Transcribing... ${progress.toFixed(0)}% (${processedChunks}/${totalChunks} chunks)`;
       }
-      return `Transcribing chunks... ${progress.toFixed(0)}%`;
+      return `Transcribing... ${progress.toFixed(0)}%`;
     }
     return "";
-  }, [processedChunks, progress, progressPhase, totalChunks]);
+  }, [downloadedBytes, processedChunks, progress, progressPhase, totalBytes, totalChunks]);
 
   const etaLabel = useMemo(() => {
     if (progressPhase !== "transcribing") {
@@ -691,7 +702,7 @@ export default function Home() {
 
   const placeholderText =
     status === "loading"
-      ? "Downloading and initializing Whisper Base. This can take a moment on first run."
+      ? "Downloading and initializing Whisper Small. This may take a moment on first run — the model is cached afterwards."
       : status === "decoding"
         ? "Decoding and resampling audio to 16kHz..."
         : status === "transcribing"
@@ -763,6 +774,11 @@ export default function Home() {
 
         {showProgressBar ? (
           <div className="mt-3 space-y-2 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
+            {progressPhase === "download" ? (
+              <p className="text-xs text-amber-300/80">
+                ⬇ First run only — model will be cached in your browser after this download.
+              </p>
+            ) : null}
             <div className="flex items-center justify-between gap-4">
               <div className="space-y-0.5">
                 <p className="text-xs text-neutral-300 sm:text-sm">{progressLabel}</p>
@@ -811,7 +827,14 @@ export default function Home() {
 
         <div className="mt-4 overflow-hidden rounded-xl border border-white/10 bg-neutral-950/75">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-4 py-2">
-            <p className="text-sm font-medium text-neutral-200">Transcript Output</p>
+            <div className="flex items-center gap-3">
+              <p className="text-sm font-medium text-neutral-200">Transcript Output</p>
+              {output ? (
+                <span className="text-xs text-neutral-500">
+                  {output.trim().split(/\s+/).filter(Boolean).length} words
+                </span>
+              ) : null}
+            </div>
             <div className="flex items-center gap-2">
               <div ref={exportMenuRef} className="relative">
                 <button
@@ -953,7 +976,7 @@ export default function Home() {
         </div>
 
         <div className="mt-4 rounded-lg border border-white/10 bg-neutral-950/70 px-3 py-2 text-xs text-neutral-400 sm:text-sm">
-          Supports <span className="font-medium text-neutral-300">.mp3, .wav, .m4a, .mp4</span>.
+          Supports <span className="font-medium text-neutral-300">.mp3, .wav, .m4a, .mp4, .ogg</span>.
           Transcription runs in-browser with{" "}
           <span className="font-medium text-neutral-300">Xenova/whisper-small</span>.
         </div>
