@@ -713,7 +713,6 @@ export default function Home() {
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-10 sm:px-6">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_10%,rgba(34,211,238,0.14),transparent_40%),radial-gradient(circle_at_80%_90%,rgba(59,130,246,0.12),transparent_35%)]" />
 
       <section className="relative w-full max-w-4xl rounded-2xl border border-white/10 bg-neutral-900/70 p-6 shadow-[0_0_0_1px_rgba(255,255,255,0.03),0_24px_80px_rgba(0,0,0,0.55)] backdrop-blur-sm sm:p-8">
         <header className="mb-8 space-y-3">
@@ -796,7 +795,7 @@ export default function Home() {
             </div>
             <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
               <div
-                className="h-full rounded-full bg-gradient-to-r from-cyan-300 to-blue-400 transition-all duration-300"
+                className="h-full rounded-full bg-cyan-400 transition-all duration-300"
                 style={{ width: `${progress}%` }}
               />
             </div>
