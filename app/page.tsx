@@ -227,6 +227,7 @@ export default function Home() {
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState<number | null>(null);
   const [totalBytes, setTotalBytes] = useState<number | null>(null);
+  const [viewMode, setViewMode] = useState<"plain" | "timestamps">("timestamps");
 
   const clearProgressState = useCallback(() => {
     setProgress(0);
@@ -501,6 +502,7 @@ export default function Home() {
       setActiveFileName(file.name);
       setOutput("");
       setSegments([]);
+      setViewMode("timestamps");
       setCopyState("idle");
       setCopyFeedback(null);
       setIsExportMenuOpen(false);
@@ -833,6 +835,34 @@ export default function Home() {
                   {output.trim().split(/\s+/).filter(Boolean).length} words
                 </span>
               ) : null}
+              {segments.length > 0 ? (
+                <div className="flex items-center rounded-md border border-white/10 bg-neutral-900 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("plain")}
+                    className={[
+                      "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                      viewMode === "plain"
+                        ? "bg-cyan-400/15 text-cyan-200"
+                        : "text-neutral-400 hover:text-neutral-200",
+                    ].join(" ")}
+                  >
+                    Plain text
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("timestamps")}
+                    className={[
+                      "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                      viewMode === "timestamps"
+                        ? "bg-cyan-400/15 text-cyan-200"
+                        : "text-neutral-400 hover:text-neutral-200",
+                    ].join(" ")}
+                  >
+                    With timestamps
+                  </button>
+                </div>
+              ) : null}
             </div>
             <div className="flex items-center gap-2">
               <div ref={exportMenuRef} className="relative">
@@ -936,7 +966,7 @@ export default function Home() {
                 <div className="h-3 w-11/12 rounded bg-neutral-800" />
                 <div className="h-3 w-7/12 rounded bg-neutral-800" />
               </div>
-            ) : segments.length > 0 ? (
+            ) : segments.length > 0 && viewMode === "timestamps" ? (
               <div className="max-h-[520px] overflow-y-auto rounded-lg border border-white/10 bg-neutral-900/50">
                 <ul className="divide-y divide-white/5">
                   {segments.map((segment, index) => (
@@ -959,6 +989,16 @@ export default function Home() {
                   ))}
                 </ul>
               </div>
+            ) : segments.length > 0 && viewMode === "plain" ? (
+              <textarea
+                ref={outputTextareaRef}
+                readOnly
+                value={output}
+                className={[
+                  "w-full min-h-[220px] max-h-[520px] resize-none rounded-lg border border-white/10 bg-neutral-900/60 p-4 text-sm leading-6 text-neutral-200 outline-none",
+                  fontMode === "mono" ? "font-mono" : "font-sans",
+                ].join(" ")}
+              />
             ) : (
               <textarea
                 ref={outputTextareaRef}
