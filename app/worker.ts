@@ -67,7 +67,7 @@ const STRIDE_LENGTH_SECONDS = 5;
 const CHUNK_WINDOW_SIZE = SAMPLE_RATE * CHUNK_LENGTH_SECONDS;
 const STRIDE_SIZE = SAMPLE_RATE * STRIDE_LENGTH_SECONDS;
 const CHUNK_JUMP_SIZE = CHUNK_WINDOW_SIZE - 2 * STRIDE_SIZE;
-const ASR_MODEL_ID = "Xenova/whisper-base";
+const ASR_MODEL_ID = "Xenova/whisper-small";
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
@@ -340,8 +340,9 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
       stride_length_s: STRIDE_LENGTH_SECONDS,
       task: "transcribe",
       temperature: 0,
-      no_repeat_ngram_size: 2,
-      repetition_penalty: 1.2,
+      num_beams: 5,
+      no_repeat_ngram_size: 3,
+      repetition_penalty: 1.3,
       chunk_callback: (chunk: {
         tokens?: number[];
         stride?: number[];

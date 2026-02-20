@@ -58,7 +58,7 @@ type TranscriptExportJson = {
   version: 1;
   createdAt: string;
   fileName: string | null;
-  model: "Xenova/whisper-base";
+  model: "Xenova/whisper-small";
   language: "auto" | WhisperLanguage;
   text: string;
   segments: TranscriptSegment[];
@@ -555,7 +555,7 @@ export default function Home() {
       version: 1,
       createdAt: new Date().toISOString(),
       fileName: activeFileName ?? null,
-      model: "Xenova/whisper-base",
+      model: "Xenova/whisper-small",
       language: selectedLanguage,
       text: output,
       segments,
@@ -955,7 +955,7 @@ export default function Home() {
         <div className="mt-4 rounded-lg border border-white/10 bg-neutral-950/70 px-3 py-2 text-xs text-neutral-400 sm:text-sm">
           Supports <span className="font-medium text-neutral-300">.mp3, .wav, .m4a, .mp4</span>.
           Transcription runs in-browser with{" "}
-          <span className="font-medium text-neutral-300">Xenova/whisper-base</span>.
+          <span className="font-medium text-neutral-300">Xenova/whisper-small</span>.
         </div>
 
         {busy ? (
