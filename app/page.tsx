@@ -7,14 +7,12 @@ import {
   Clock3,
   Copy,
   Cpu,
-  Download,
   FileJson,
   Linkedin,
   Lock,
   Monitor,
   ShieldCheck,
   Square,
-  Type,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { UploadDropzone } from "@/components/upload-dropzone";
@@ -36,7 +34,6 @@ type WhisperLanguage =
 type LanguageOption = { value: "auto" | WhisperLanguage; label: string; flag: string };
 type ProgressPhase = "download" | "transcribing";
 type CopyState = "idle" | "success" | "error";
-type FontMode = "sans" | "mono";
 type SmartExportAction = "copy_text_only" | "copy_with_timestamps" | "export_json";
 
 type WorkerStatus = "loading" | "ready" | "transcribing" | "error";
@@ -218,7 +215,6 @@ export default function Home() {
   const [selectedLanguage, setSelectedLanguage] = useState<"auto" | WhisperLanguage | null>(null);
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
-  const [fontMode, setFontMode] = useState<FontMode>("sans");
   const [isCancelling, setIsCancelling] = useState(false);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
@@ -550,7 +546,7 @@ export default function Home() {
     if (status === "transcribing") {
       textarea.scrollTop = textarea.scrollHeight;
     }
-  }, [fontMode, output, status]);
+  }, [output, status]);
 
   useEffect(() => {
     if (progressPhase !== "transcribing" || etaSeconds === null || etaSeconds <= 0) {
@@ -733,16 +729,6 @@ export default function Home() {
       writeToClipboard,
     ],
   );
-
-  const handleDownloadTxt = useCallback(() => {
-    if (!output.trim()) return;
-
-    triggerDownload(
-      output.trim(),
-      `transcription-${timestampForFilename(new Date())}.txt`,
-      "text/plain;charset=utf-8",
-    );
-  }, [output, triggerDownload]);
 
   const progressLabel = useMemo(() => {
     if (progressPhase === "download") {
@@ -1312,25 +1298,6 @@ export default function Home() {
                   </div>
                 ) : null}
               </div>
-
-              <button
-                type="button"
-                onClick={handleDownloadTxt}
-                disabled={!timestampedExport.trim()}
-                className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-neutral-900 px-2.5 py-1.5 text-xs font-medium text-neutral-200 transition-colors hover:border-cyan-400/40 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Download className="size-3.5" />
-                Download .txt
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setFontMode((prev) => (prev === "sans" ? "mono" : "sans"))}
-                className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-neutral-900 px-2.5 py-1.5 text-xs font-medium text-neutral-200 transition-colors hover:border-cyan-400/40 hover:bg-neutral-800"
-              >
-                <Type className="size-3.5" />
-                {fontMode === "sans" ? "Mono" : "Sans"}
-              </button>
             </div>
           </div>
 
@@ -1370,10 +1337,7 @@ export default function Home() {
                         [{formatSegmentTimestamp(segment.start)}]
                       </span>
                       <p
-                        className={[
-                          "text-sm leading-6 text-neutral-200",
-                          fontMode === "mono" ? "font-mono" : "font-sans",
-                        ].join(" ")}
+                        className="text-sm leading-6 text-neutral-200 font-sans"
                       >
                         {segment.text}
                       </p>
@@ -1387,22 +1351,10 @@ export default function Home() {
                 readOnly
                 value={output}
                 className={[
-                  "w-full min-h-[220px] max-h-[520px] resize-none rounded-lg border border-white/10 bg-neutral-900/60 p-4 text-sm leading-6 text-neutral-200 outline-none",
-                  fontMode === "mono" ? "font-mono" : "font-sans",
+                  "w-full min-h-[220px] resize-none rounded-lg border border-white/10 bg-neutral-900/60 p-4 text-sm leading-6 text-neutral-200 outline-none font-sans",
                 ].join(" ")}
               />
-            ) : (
-              <textarea
-                ref={outputTextareaRef}
-                readOnly
-                value={output}
-                placeholder={placeholderText}
-                className={[
-                  "w-full min-h-[220px] max-h-[520px] resize-none rounded-lg border border-white/10 bg-neutral-900/60 p-4 text-sm leading-6 text-neutral-200 outline-none",
-                  fontMode === "mono" ? "font-mono" : "font-sans",
-                ].join(" ")}
-              />
-            )}
+            ) : null}
           </div>
         </div>
 
@@ -1445,6 +1397,17 @@ export default function Home() {
               >
                 <svg height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0"><path d="M21.6 0H2.4C1.08 0 0 1.08 0 2.4v19.2C0 22.92 1.08 24 2.4 24h19.2c1.32 0 2.4-1.08 2.4-2.4V2.4C24 1.08 22.92 0 21.6 0zm-3.12 18.48h-2.04l-3.12-4.56-3.36 4.56H7.92l4.32-5.76L7.8 5.52h2.04l2.88 4.2 3.12-4.2h2.04l-4.2 5.52 4.8 7.44z" fill="currentColor"/></svg>
                 Grok
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(output.trim()).catch(() => {});
+                  window.open("https://copilot.microsoft.com/", "_blank", "noopener,noreferrer");
+                }}
+                className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-300 transition-colors hover:border-white/25 hover:bg-neutral-800 hover:text-white"
+              >
+                <svg height="13" viewBox="0 0 21 21" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0"><path d="M0 0h10v10H0V0zm11 0h10v10H11V0zM0 11h10v10H0V11zm11 0h10v10H11V11z" fill="currentColor"/></svg>
+                Copilot
               </button>
             </div>
           </div>
