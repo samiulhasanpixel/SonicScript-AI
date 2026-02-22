@@ -357,10 +357,18 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     const STRIDE_SAMPLES = STRIDE_LENGTH_S * SAMPLE_RATE;  // 5 s  =  80 000
     const JUMP_SAMPLES   = CHUNK_JUMP_SAMPLES;             // 20 s = 320 000
 
-    // Minimum window length: 0.5 s = 8 000 samples at 16 kHz.
-    // Windows shorter than this produce no Whisper tokens, which causes
-    // the tokenizer to throw "token_ids must be a non-empty array of integers".
-    const MIN_WINDOW_SAMPLES = Math.round(0.5 * SAMPLE_RATE);
+    // Minimum window length the model can reliably produce tokens for.
+    // Shorter clips are zero-padded to this length to prevent the tokenizer
+    // from throwing "token_ids must be a non-empty array of integers".
+    const MIN_WINDOW_SAMPLES = 1 * SAMPLE_RATE; // 1 second
+
+    /** Zero-pad a short buffer to at least `minLen` samples. */
+    function padToMinLength(buf: Float32Array, minLen: number): Float32Array {
+      if (buf.length >= minLen) return buf;
+      const padded = new Float32Array(minLen); // zeros by default
+      padded.set(buf);
+      return padded;
+    }
 
     // Build the list of overlapping windows
     type Window = { data: Float32Array; offsetS: number };
@@ -369,17 +377,16 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     while (offset < audio.length) {
       const end = Math.min(offset + WINDOW_SAMPLES, audio.length);
       const slice = audio.slice(offset, end);
-      // Skip the tail window if it is too short for the model to process.
-      if (slice.length >= MIN_WINDOW_SAMPLES) {
-        windows.push({ data: slice, offsetS: offset / SAMPLE_RATE });
-      }
+      // Pad short tail windows with silence instead of skipping them.
+      const windowData = padToMinLength(slice, MIN_WINDOW_SAMPLES);
+      windows.push({ data: windowData, offsetS: offset / SAMPLE_RATE });
       if (end >= audio.length) break;
       offset += JUMP_SAMPLES;
     }
 
-    // If all windows were filtered out (very short file) add the whole audio.
+    // Safety net: if audio was empty, push the whole thing.
     if (windows.length === 0 && audio.length > 0) {
-      windows.push({ data: audio.slice(0), offsetS: 0 });
+      windows.push({ data: padToMinLength(audio.slice(0), MIN_WINDOW_SAMPLES), offsetS: 0 });
     }
 
     const totalWindows = windows.length;
@@ -403,39 +410,47 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     for (let i = 0; i < totalWindows; i++) {
       const win = windows[i];
 
-      // Pass the actual window duration so the pipeline does not perform
-      // additional internal chunking on an already-sliced window.
-      const windowDurationS = win.data.length / SAMPLE_RATE;
+      try {
+        const result = await transcriber(win.data, {
+          return_timestamps: true,
+          // chunk_length_s = 30 → the standard Whisper window size.
+          // Since every window is already ≤ 30 s the pipeline will treat it
+          // as a single internal chunk with no further sub-windowing.
+          chunk_length_s: CHUNK_LENGTH_S,
+          stride_length_s: 0,
+          // Greedy decoding – one forward pass per chunk, no beam-search overhead.
+          temperature: 0,
+          num_beams: 1,
+          language: languageHint && languageHint !== "auto" ? languageHint : undefined,
+        } as Record<string, unknown>);
 
-      const result = await transcriber(win.data, {
-        return_timestamps: true,
-        // Use the real window duration instead of 0 — passing 0 can trigger
-        // edge-case paths in transformers.js that emit empty token arrays.
-        chunk_length_s: windowDurationS,
-        // Greedy decoding – one forward pass per chunk, no beam-search overhead.
-        temperature: 0,
-        num_beams: 1,
-        language: languageHint && languageHint !== "auto" ? languageHint : undefined,
-      } as Record<string, unknown>);
+        const normalized = Array.isArray(result) ? result[0] : result;
 
-      const normalized = Array.isArray(result) ? result[0] : result;
+        // ── Collect segments and offset timestamps ──────────────────────────
+        const rawChunks = Array.isArray(normalized?.chunks) ? normalized.chunks : [];
+        for (const chunk of rawChunks) {
+          const text = typeof chunk.text === "string" ? chunk.text.trim() : "";
+          if (!text) continue;
+          const ts = Array.isArray(chunk.timestamp) ? chunk.timestamp : [0, 0];
+          const start = toSafeTimestamp(ts[0], 0) + win.offsetS;
+          const end   = toSafeTimestamp(ts[1], toSafeTimestamp(ts[0], 0)) + win.offsetS;
+          allSegments.push({ text, start, end });
+        }
 
-      // ── Collect segments and offset timestamps ────────────────────────────
-      const rawChunks = Array.isArray(normalized?.chunks) ? normalized.chunks : [];
-      for (const chunk of rawChunks) {
-        const text = typeof chunk.text === "string" ? chunk.text.trim() : "";
-        if (!text) continue;
-        const ts = Array.isArray(chunk.timestamp) ? chunk.timestamp : [0, 0];
-        const start = toSafeTimestamp(ts[0], 0) + win.offsetS;
-        const end   = toSafeTimestamp(ts[1], toSafeTimestamp(ts[0], 0)) + win.offsetS;
-        allSegments.push({ text, start, end });
-      }
-
-      // ── Live preview ──────────────────────────────────────────────────────
-      const windowText = normalizeWhitespace(normalized?.text ?? "");
-      if (windowText) {
-        accumulatedTexts.push(windowText);
-        postToMain({ type: "partial", text: accumulatedTexts.join(" "), requestId });
+        // ── Live preview ────────────────────────────────────────────────────
+        const windowText = normalizeWhitespace(normalized?.text ?? "");
+        if (windowText) {
+          accumulatedTexts.push(windowText);
+          postToMain({ type: "partial", text: accumulatedTexts.join(" "), requestId });
+        }
+      } catch (windowError) {
+        // Gracefully skip windows where the model produces zero tokens.
+        // This typically happens on silent or very noisy segments where
+        // Whisper's decoder emits an empty token_ids array.
+        console.warn(
+          `[worker] Window ${i + 1}/${totalWindows} failed — skipping:`,
+          errorMessage(windowError),
+        );
       }
 
       // ── Progress ──────────────────────────────────────────────────────────
