@@ -25,6 +25,7 @@ type TranscriptSegment = {
 
 type WorkerRequest =
   | { type: "load" }
+  | { type: "cancel"; requestId: number }
   | {
       type: "transcribe";
       requestId: number;
@@ -87,8 +88,8 @@ const workerScope = self as unknown as WorkerScope;
 
 let transcriberPromise: Promise<AutomaticSpeechRecognitionPipeline> | null = null;
 /** Tracks which device the active pipeline was initialised on. */
-let activeDevice: "webgpu" | "wasm" | null = null;
-
+let activeDevice: "webgpu" | "wasm" | null = null;/** When set, the transcription loop for this requestId should abort after the current window. */
+let abortRequestId: number | null = null;
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function postToMain(message: WorkerResponse): void {
@@ -330,10 +331,16 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     return;
   }
 
+  if (message.type === "cancel") {
+    abortRequestId = message.requestId;
+    return;
+  }
+
   if (message.type !== "transcribe") return;
 
   const { requestId, audio } = message;
   const languageHint = message.language;
+  abortRequestId = null; // clear any stale abort from a previous run
 
   try {
     const transcriber = await getTranscriber();
@@ -458,13 +465,16 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
       postToMain({
         type: "progress",
         phase: "transcribing",
-        progress: normalizeProgress((processed / totalWindows) * 100),
+        progress: Math.max(0, Math.min(100, (processed / totalWindows) * 100)),
         requestId,
         processedChunks: processed,
         totalChunks: totalWindows,
         currentSlice: 1,
         totalSlices: 1,
       });
+
+      // Honour a cancel request that arrived between windows.
+      if (abortRequestId === requestId) return;
     }
 
     // ── Merge + deduplicate segments ─────────────────────────────────────────

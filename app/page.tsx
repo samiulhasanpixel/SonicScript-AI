@@ -40,7 +40,8 @@ type WorkerStatus = "loading" | "ready" | "transcribing" | "error";
 type TranscriptionStatus = "idle" | "loading" | "decoding" | "transcribing" | "ready" | "error";
 
 type WorkerRequest =
-  | { type: "load" }
+  | { type: "load"; model?: string }
+  | { type: "cancel"; requestId: number }
   | {
     type: "transcribe";
     requestId: number;
@@ -219,6 +220,7 @@ export default function Home() {
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
   const [isLangShaking, setIsLangShaking] = useState(false);
+  const [isModelShaking, setIsModelShaking] = useState(false);
   const [justCompleted, setJustCompleted] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState<number | null>(null);
   const [totalBytes, setTotalBytes] = useState<number | null>(null);
@@ -230,29 +232,26 @@ export default function Home() {
   const [warmUpElapsed, setWarmUpElapsed] = useState(0);
   const [isMobile, setIsMobile] = useState(false);
   const [gpuSupported, setGpuSupported] = useState(true);
-  const [isAppInitializing, setIsAppInitializing] = useState(true);
-  const hasSeenLoadingRef = useRef(false);
 
   useEffect(() => {
     setIsMobile(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
     setGpuSupported("gpu" in navigator);
   }, []);
 
+  // Kick off model preload as soon as the user picks a language.
+  // The worker's getTranscriber() caches the pipeline, so when the
+  // user later drops a file the model is already ready (or still
+  // downloading — in which case the transcribe request just awaits).
   useEffect(() => {
-    if (status === "loading") {
-      hasSeenLoadingRef.current = true;
-    }
-    if (isAppInitializing && hasSeenLoadingRef.current && status !== "loading") {
-      setIsAppInitializing(false);
-    }
-  }, [status, isAppInitializing]);
+    if (!selectedLanguage) return;
+    const worker = workerRef.current;
+    if (!worker) return;
+    if (status !== "idle") return; // already loading / ready / transcribing
+    const loadRequest: WorkerRequest = { type: "load" };
+    worker.postMessage(loadRequest);
+  }, [selectedLanguage]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Safety fallback: if worker never sends "loading" (e.g. instant cache hit), clear skeleton after 3s
-  useEffect(() => {
-    if (!isAppInitializing) return;
-    const id = window.setTimeout(() => setIsAppInitializing(false), 3000);
-    return () => window.clearTimeout(id);
-  }, [isAppInitializing]);
+
 
   // Flash "Transcription complete" badge only when transitioning transcribing → ready
   const prevStatusRef = useRef<typeof status | null>(null);
@@ -297,6 +296,8 @@ export default function Home() {
         } else if (message.status === "transcribing") {
           setStatus("transcribing");
           setLoadingDetail(null);
+          setProgress(0);
+          setProgressPhase("transcribing");
           if (message.device) setActiveDevice(message.device as "webgpu" | "wasm");
         } else if (message.status === "ready") {
           setStatus("ready");
@@ -440,29 +441,46 @@ export default function Home() {
       clearProgressState();
     };
 
-    const loadRequest: WorkerRequest = { type: "load" };
-    worker.postMessage(loadRequest);
     return worker;
   }, [clearProgressState, handleWorkerMessage]);
 
   const cancelTranscription = useCallback(() => {
+    const currentRequestId = activeRequestIdRef.current;
     activeRequestIdRef.current += 1;
     setIsCancelling(true);
-    setStatus("idle");
     setError(null);
     clearProgressState();
 
-    if (workerRef.current) {
-      workerRef.current.terminate();
-      workerRef.current = null;
-    }
+    const isModelLoaded =
+      status === "ready" || status === "transcribing" || status === "decoding";
 
-    initializeWorker();
+    if (isModelLoaded) {
+      // Model is already in memory — just abort the running transcription.
+      // No need to kill the worker; the loaded pipeline stays intact.
+      if (workerRef.current) {
+        const cancelRequest: WorkerRequest = { type: "cancel", requestId: currentRequestId };
+        (workerRef.current as Worker).postMessage(cancelRequest);
+      }
+      setStatus("ready");
+      setActiveFileName(null);
+    } else {
+      // Model wasn't loaded yet — terminate and let it restart cleanly.
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      const newWorker = initializeWorker();
+      if (selectedLanguage && newWorker) {
+        const loadRequest: WorkerRequest = { type: "load" };
+        newWorker.postMessage(loadRequest);
+      }
+      setStatus("idle");
+    }
 
     window.setTimeout(() => {
       setIsCancelling(false);
     }, 300);
-  }, [clearProgressState, initializeWorker]);
+  }, [clearProgressState, initializeWorker, selectedLanguage, status]);
 
   useEffect(() => {
     initializeWorker();
@@ -565,11 +583,12 @@ export default function Home() {
     };
   }, [etaSeconds, progressPhase]);
 
-  const handleFileSelected = useCallback(
+  const startTranscription = useCallback(
     async (file: File) => {
-      if (!selectedLanguage) return;
-
-      if (status === "loading" || status === "transcribing" || status === "decoding") {
+      // Don't cancel/restart the worker if we're only preloading the model
+      // (status === "loading" with no active file). Only cancel if a previous
+      // transcription is already in flight.
+      if (status === "transcribing" || status === "decoding") {
         cancelTranscription();
       }
 
@@ -616,6 +635,14 @@ export default function Home() {
       }
     },
     [cancelTranscription, clearProgressState, selectedLanguage, status],
+  );
+
+  const handleFileSelected = useCallback(
+    (file: File) => {
+      if (!selectedLanguage) return;
+      startTranscription(file);
+    },
+    [selectedLanguage, startTranscription],
   );
 
   const plainTextExport = useMemo(() => {
@@ -733,11 +760,13 @@ export default function Home() {
   const progressLabel = useMemo(() => {
     if (progressPhase === "download") {
       if (downloadedBytes !== null && totalBytes !== null && totalBytes > 0) {
-        const dlMB = (downloadedBytes / (1024 * 1024)).toFixed(1);
         const totalMB = (totalBytes / (1024 * 1024)).toFixed(1);
-        return `Downloading model... ${dlMB} MB / ${totalMB} MB (${progress.toFixed(0)}%)`;
+        const dlMB = (downloadedBytes / (1024 * 1024)).toFixed(1).padStart(totalMB.length, "\u00A0");
+        const pct = progress.toFixed(0).padStart(3, "\u00A0");
+        return `Downloading model\u2026 ${dlMB} / ${totalMB} MB (${pct}%)`;
       }
-      return `Downloading model... ${progress.toFixed(0)}%`;
+      const pct = progress.toFixed(0).padStart(3, "\u00A0");
+      return `Downloading model\u2026 ${pct}%`;
     }
     if (progressPhase === "transcribing") {
       // Processed audio time: each 30-s chunk with 10-s jump = 20 s of new audio per chunk
@@ -799,6 +828,11 @@ export default function Home() {
 
   const busy =
     status === "loading" || status === "decoding" || status === "transcribing" || isCancelling;
+  // Only show the compact file row (instead of dropzone) when there's an active file being processed.
+  // During model preloading (status === "loading", activeFileName === null) we keep the dropzone visible.
+  const uploadBusy = busy && activeFileName !== null;
+  /** True once the model pipeline is loaded and ready to transcribe. */
+  const modelReady = status === "ready" || status === "transcribing" || status === "decoding";
   const isCompiling = status === "loading" && loadingDetail === "compiling";
   /** True between "transcribing" status and the very first chunk_callback firing. */
   const isWarmingUp =
@@ -818,9 +852,7 @@ export default function Home() {
     const id = window.setInterval(() => setWarmUpElapsed((prev) => prev + 1), 1_000);
     return () => window.clearInterval(id);
   }, [isWarmingUp]);
-  const showProgressBar =
-    (progressPhase === "download" && !isCompiling) ||
-    (progressPhase === "transcribing" && !isWarmingUp);
+  const showProgressBar = progressPhase === "transcribing" && !isWarmingUp;
   const showSkeleton =
     !output && (status === "loading" || status === "decoding" || status === "transcribing");
 
@@ -904,34 +936,6 @@ export default function Home() {
           </div>
         </div>
 
-        {isAppInitializing ? (
-          /* ── Skeleton while model loads ─────────────────────────────── */
-          <div className="animate-pulse space-y-4">
-            {/* Step 1 skeleton */}
-            <div className="space-y-2">
-              <div className="h-3 w-40 rounded-full bg-neutral-700/60" />
-              <div className="h-9 w-52 rounded-lg bg-neutral-800/80" />
-            </div>
-            {/* Dropzone skeleton */}
-            <div className="space-y-2">
-              <div className="h-3 w-48 rounded-full bg-neutral-700/60" />
-              <div className="flex min-h-56 flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-neutral-700/60 bg-neutral-900/40 p-8">
-                <div className="size-12 rounded-full bg-neutral-800" />
-                <div className="space-y-2 text-center">
-                  <div className="mx-auto h-3.5 w-48 rounded-full bg-neutral-700/60" />
-                  <div className="mx-auto h-3 w-32 rounded-full bg-neutral-800/60" />
-                </div>
-                <div className="h-2.5 w-56 rounded-full bg-neutral-800/40" />
-              </div>
-            </div>
-            {/* Status row skeleton */}
-            <div className="flex items-center gap-3">
-              <div className="h-6 w-28 rounded-full bg-neutral-800/80" />
-              <div className="h-4 w-32 rounded-full bg-neutral-800/40" />
-            </div>
-          </div>
-        ) : (
-          <>
             <div className="mb-4">
               <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
                 Step 1 — Select the audio language
@@ -1003,12 +1007,84 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Step 2 — Upload */}
-            {busy ? (
+            {/* Step 2 — Load AI model (hidden once ready) */}
+            {!modelReady && (
+            <div
+              className={["mb-4", isModelShaking ? "model-shake" : ""].join(" ")}
+              onAnimationEnd={() => setIsModelShaking(false)}
+            >
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
+                Step 2 — Load AI model
+              </p>
+              {!selectedLanguage ? (
+                <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5 opacity-50">
+                  <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor" className="shrink-0 text-neutral-400"><path d="M240-80q-33 0-56.5-23.5T160-160v-400q0-33 23.5-56.5T240-640h40v-80q0-83 58.5-141.5T480-920q83 0 141.5 58.5T680-720v80h40q33 0 56.5 23.5T800-560v400q0 33-23.5 56.5T720-80H240Zm0-80h480v-400H240v400Zm240-120q33 0 56.5-23.5T560-360q0-33-23.5-56.5T480-440q-33 0-56.5 23.5T400-360q0 33 23.5 56.5T480-280ZM480-640h160v-80q0-50-35-85t-85-35q-50 0-85 35t-35 85v80Zm-240 480v-400 400Z"/></svg>
+                  <span className="text-sm text-neutral-400">Select a language first</span>
+                </div>
+              ) : isCompiling ? (
+                <div className="space-y-2 rounded-xl border border-violet-500/20 bg-violet-500/5 p-3">
+                  <p className="text-xs text-violet-300/90">First-time setup — compiling WebGPU shaders. Cached after this run.</p>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="space-y-0.5">
+                      <p className="text-xs text-neutral-300 sm:text-sm">Preparing GPU kernels… this takes 1–2 minutes on first run.</p>
+                      <p className="text-xs text-neutral-500">You can leave this tab open and wait.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={cancelTranscription}
+                      disabled={isCancelling}
+                      className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <Square className="size-3.5" />
+                      {isCancelling ? "Cancelling..." : "Cancel"}
+                    </button>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
+                    <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-violet-600/40 via-violet-400 to-violet-600/40 bg-[length:200%_100%]" />
+                  </div>
+                </div>
+              ) : progressPhase === "download" ? (
+                <div className="space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-xs font-medium text-neutral-200 sm:text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>{progressLabel}</p>
+                    <button
+                      type="button"
+                      onClick={cancelTranscription}
+                      disabled={isCancelling}
+                      className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <Square className="size-3.5" />
+                      {isCancelling ? "Cancelling..." : "Cancel"}
+                    </button>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
+                    <div
+                      className="h-full rounded-full bg-cyan-400 transition-all duration-300"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                  {etaLabel ? (
+                    <p className="text-xs text-neutral-500" style={{ fontVariantNumeric: "tabular-nums" }}>{etaLabel}</p>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
+                  <svg className="size-4 animate-spin text-neutral-400" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                  <span className="text-sm text-neutral-400">Loading model…</span>
+                </div>
+              )}
+            </div>
+            )}
+
+            {/* Step 2/3 — Upload */}
+            {uploadBusy ? (
               /* While processing: hide the full dropzone, show only the compact file row */
               <div>
                 <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                  Step 2 — Upload your audio file
+                  {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
                 </p>
                 <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
                   <div className="flex min-w-0 items-center gap-2.5">
@@ -1020,54 +1096,23 @@ export default function Home() {
               </div>
             ) : (
               <div className="relative">
-                <div className={selectedLanguage ? "" : "pointer-events-none opacity-40"}>
+                <div className={(!selectedLanguage || !modelReady) ? "pointer-events-none opacity-40" : ""}>
                   <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                    Step 2 — Upload your audio file
+                    {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
                   </p>
                   <UploadDropzone onFileSelected={handleFileSelected} />
                 </div>
-                {!selectedLanguage && (
+                {(!selectedLanguage || !modelReady) && (
                   <div
                     className="absolute inset-0 cursor-pointer"
                     onClick={() => {
-                      setIsLangShaking(true);
-                      setIsLangMenuOpen(true);
+                      if (!selectedLanguage) { setIsLangShaking(true); setIsLangMenuOpen(true); }
+                      if (!modelReady) { setIsModelShaking(true); }
                     }}
                   />
                 )}
               </div>
             )}
-
-
-
-            {isCompiling ? (
-              <div className="mt-3 space-y-2 rounded-xl border border-violet-500/20 bg-violet-500/5 p-3">
-                <p className="text-xs text-violet-300/90">
-                  First-time setup — compiling WebGPU shaders. Cached after this run.
-                </p>
-                <div className="flex items-center justify-between gap-4">
-                  <div className="space-y-0.5">
-                    <p className="text-xs text-neutral-300 sm:text-sm">
-                      Preparing GPU kernels… this takes 1–2 minutes on first run.
-                    </p>
-                    <p className="text-xs text-neutral-500">You can leave this tab open and wait.</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={cancelTranscription}
-                    disabled={isCancelling}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    <Square className="size-3.5" />
-                    {isCancelling ? "Cancelling..." : "Cancel"}
-                  </button>
-                </div>
-                {/* Indeterminate progress bar — no granular events during shader compilation */}
-                <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
-                  <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-violet-600/40 via-violet-400 to-violet-600/40 bg-[length:200%_100%]" />
-                </div>
-              </div>
-            ) : null}
 
             {isWarmingUp ? (
               <div className="mt-3 rounded-xl border border-cyan-500/20 bg-neutral-950/60 p-4 shadow-inner">
@@ -1131,15 +1176,9 @@ export default function Home() {
 
             {showProgressBar ? (
               <div className="mt-3 space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
-                {progressPhase === "download" ? (
-                  <p className="text-xs text-amber-300/80">
-                    First run only — model will be cached in your browser after this download.
-                  </p>
-                ) : null}
-
                 {/* ── Top row: label + cancel ─────────────────────────────────── */}
                 <div className="flex items-center justify-between gap-4">
-                  <p className="text-xs font-medium text-neutral-200 sm:text-sm">{progressLabel}</p>
+                  <p className="text-xs font-medium text-neutral-200 sm:text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>{progressLabel}</p>
                   <button
                     type="button"
                     onClick={cancelTranscription}
@@ -1180,7 +1219,7 @@ export default function Home() {
 
                 {/* ── ETA row ─────────────────────────────────────────────────── */}
                 {etaLabel ? (
-                  <p className="text-xs text-neutral-500">{etaLabel}</p>
+                  <p className="text-xs text-neutral-500" style={{ fontVariantNumeric: "tabular-nums" }}>{etaLabel}</p>
                 ) : null}
               </div>
             ) : null}
@@ -1206,9 +1245,6 @@ export default function Home() {
                 <span>{error}</span>
               </div>
             ) : null}
-
-          </>
-        )}
 
         <div className={["mt-4 overflow-hidden rounded-xl border border-white/10 bg-neutral-950/75", justCompleted ? "transcript-flash" : ""].join(" ")}>
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-4 py-2">
@@ -1479,7 +1515,7 @@ export default function Home() {
               "100% Client-side processing",
               "Privacy first - no data uploads",
               "Supports multiple audio formats",
-              "High accuracy with Whisper AI",
+              "High accuracy with Whisper Small",
               "Free to use"
             ]
           })
