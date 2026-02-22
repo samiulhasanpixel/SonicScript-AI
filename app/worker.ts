@@ -357,15 +357,29 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     const STRIDE_SAMPLES = STRIDE_LENGTH_S * SAMPLE_RATE;  // 5 s  =  80 000
     const JUMP_SAMPLES   = CHUNK_JUMP_SAMPLES;             // 20 s = 320 000
 
+    // Minimum window length: 0.5 s = 8 000 samples at 16 kHz.
+    // Windows shorter than this produce no Whisper tokens, which causes
+    // the tokenizer to throw "token_ids must be a non-empty array of integers".
+    const MIN_WINDOW_SAMPLES = Math.round(0.5 * SAMPLE_RATE);
+
     // Build the list of overlapping windows
     type Window = { data: Float32Array; offsetS: number };
     const windows: Window[] = [];
     let offset = 0;
     while (offset < audio.length) {
       const end = Math.min(offset + WINDOW_SAMPLES, audio.length);
-      windows.push({ data: audio.slice(offset, end), offsetS: offset / SAMPLE_RATE });
+      const slice = audio.slice(offset, end);
+      // Skip the tail window if it is too short for the model to process.
+      if (slice.length >= MIN_WINDOW_SAMPLES) {
+        windows.push({ data: slice, offsetS: offset / SAMPLE_RATE });
+      }
       if (end >= audio.length) break;
       offset += JUMP_SAMPLES;
+    }
+
+    // If all windows were filtered out (very short file) add the whole audio.
+    if (windows.length === 0 && audio.length > 0) {
+      windows.push({ data: audio.slice(0), offsetS: 0 });
     }
 
     const totalWindows = windows.length;
@@ -389,11 +403,15 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
     for (let i = 0; i < totalWindows; i++) {
       const win = windows[i];
 
+      // Pass the actual window duration so the pipeline does not perform
+      // additional internal chunking on an already-sliced window.
+      const windowDurationS = win.data.length / SAMPLE_RATE;
+
       const result = await transcriber(win.data, {
         return_timestamps: true,
-        // chunk_length_s = 0 → pipeline treats the entire input as one chunk
-        // (no internal windowing). Each window is already ≤ 30 s.
-        chunk_length_s: 0,
+        // Use the real window duration instead of 0 — passing 0 can trigger
+        // edge-case paths in transformers.js that emit empty token arrays.
+        chunk_length_s: windowDurationS,
         // Greedy decoding – one forward pass per chunk, no beam-search overhead.
         temperature: 0,
         num_beams: 1,
