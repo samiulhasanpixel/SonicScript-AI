@@ -27,29 +27,29 @@ type WorkerRequest =
   | { type: "load" }
   | { type: "cancel"; requestId: number }
   | {
-      type: "transcribe";
-      requestId: number;
-      audio: Float32Array;
-      language?: "auto" | WhisperLanguage;
-    };
+    type: "transcribe";
+    requestId: number;
+    audio: Float32Array;
+    language?: "auto" | WhisperLanguage;
+  };
 
 type WorkerStatus = "loading" | "ready" | "transcribing" | "error";
 
 type WorkerResponse =
   | { type: "status"; status: WorkerStatus; requestId?: number; detail?: string; device?: string }
   | {
-      type: "progress";
-      phase: ProgressPhase;
-      progress: number;
-      requestId?: number;
-      processedChunks?: number;
-      totalChunks?: number;
-      currentSlice?: number;
-      totalSlices?: number;
-      loaded?: number;
-      total?: number;
-      file?: string;
-    }
+    type: "progress";
+    phase: ProgressPhase;
+    progress: number;
+    requestId?: number;
+    processedChunks?: number;
+    totalChunks?: number;
+    currentSlice?: number;
+    totalSlices?: number;
+    loaded?: number;
+    total?: number;
+    file?: string;
+  }
   | { type: "partial"; text: string; requestId: number }
   | { type: "segments"; requestId: number; text: string; segments: TranscriptSegment[] }
   | { type: "result"; text: string; requestId: number }
@@ -247,20 +247,20 @@ async function buildPipeline(
   const options =
     device === "webgpu"
       ? {
-          dtype: {
-            encoder_model: "fp16" as const,
-            decoder_model_merged: "q4" as const,
-          },
-          device: "webgpu" as const,
-          progress_callback: onDownloadProgress,
-          session_options: { logSeverityLevel: 3 as const },
-        }
+        dtype: {
+          encoder_model: "fp16" as const,
+          decoder_model_merged: "q4" as const,
+        },
+        device: "webgpu" as const,
+        progress_callback: onDownloadProgress,
+        session_options: { logSeverityLevel: 3 as const },
+      }
       : {
-          dtype: "q8" as const,
-          device: "wasm" as const,
-          progress_callback: onDownloadProgress,
-          session_options: { logSeverityLevel: 3 as const },
-        };
+        dtype: "q8" as const,
+        device: "wasm" as const,
+        progress_callback: onDownloadProgress,
+        session_options: { logSeverityLevel: 3 as const },
+      };
 
   // Cast through `unknown` to avoid the overly-complex union type that
   // @huggingface/transformers v3 pipeline overloads produce for TS.
@@ -271,7 +271,24 @@ async function buildPipeline(
   ) as unknown as Promise<AutomaticSpeechRecognitionPipeline>;
 }
 
+/** True once the pipeline has been successfully built at least once — used to
+ *  skip the "loading" flash when the model is already ready in memory. */
+let isPipelineReady = false;
+
 async function getTranscriber(): Promise<AutomaticSpeechRecognitionPipeline> {
+  // If the model is already fully ready, skip posting "loading" and jump
+  // straight to "ready" — this avoids the brief loading flash when the
+  // user changes language after the first successful load.
+  if (isPipelineReady && transcriberPromise) {
+    const transcriber = await transcriberPromise;
+    postToMain({
+      type: "status",
+      status: "ready",
+      device: activeDevice ?? undefined,
+    });
+    return transcriber;
+  }
+
   if (!transcriberPromise) {
     postToMain({ type: "status", status: "loading", detail: "Initialising model…" });
 
@@ -300,6 +317,7 @@ async function getTranscriber(): Promise<AutomaticSpeechRecognitionPipeline> {
 
   try {
     const transcriber = await transcriberPromise;
+    isPipelineReady = true;
     postToMain({
       type: "status",
       status: "ready",
@@ -309,6 +327,7 @@ async function getTranscriber(): Promise<AutomaticSpeechRecognitionPipeline> {
     return transcriber;
   } catch (error) {
     transcriberPromise = null;
+    isPipelineReady = false;
     activeDevice = null;
     const msg = errorMessage(error);
     postToMain({ type: "status", status: "error", detail: msg });
@@ -362,7 +381,7 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
 
     const WINDOW_SAMPLES = CHUNK_LENGTH_S * SAMPLE_RATE;   // 30 s = 480 000
     const STRIDE_SAMPLES = STRIDE_LENGTH_S * SAMPLE_RATE;  // 5 s  =  80 000
-    const JUMP_SAMPLES   = CHUNK_JUMP_SAMPLES;             // 20 s = 320 000
+    const JUMP_SAMPLES = CHUNK_JUMP_SAMPLES;             // 20 s = 320 000
 
     // Minimum window length the model can reliably produce tokens for.
     // Shorter clips are zero-padded to this length to prevent the tokenizer
@@ -440,7 +459,7 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
           if (!text) continue;
           const ts = Array.isArray(chunk.timestamp) ? chunk.timestamp : [0, 0];
           const start = toSafeTimestamp(ts[0], 0) + win.offsetS;
-          const end   = toSafeTimestamp(ts[1], toSafeTimestamp(ts[0], 0)) + win.offsetS;
+          const end = toSafeTimestamp(ts[1], toSafeTimestamp(ts[0], 0)) + win.offsetS;
           allSegments.push({ text, start, end });
         }
 
@@ -493,14 +512,14 @@ workerScope.addEventListener("message", async (event: MessageEvent<WorkerRequest
       rawFullText;
 
     postToMain({ type: "segments", requestId, text: canonicalText, segments });
-    postToMain({ type: "result",   text: canonicalText, requestId });
-    postToMain({ type: "status",   status: "ready", requestId });
+    postToMain({ type: "result", text: canonicalText, requestId });
+    postToMain({ type: "status", status: "ready", requestId });
   } catch (error) {
     const msg = errorMessage(error);
     postToMain({ type: "status", status: "error", requestId, detail: msg });
-    postToMain({ type: "error",  error: msg, requestId });
+    postToMain({ type: "error", error: msg, requestId });
   }
 });
 
-export {};
+export { };
 

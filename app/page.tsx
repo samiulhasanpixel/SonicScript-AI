@@ -277,11 +277,16 @@ export default function Home() {
   // The worker's getTranscriber() caches the pipeline, so when the
   // user later drops a file the model is already ready (or still
   // downloading — in which case the transcribe request just awaits).
+  // If the model is already "ready" (previously loaded), skip re-sending
+  // the load message so we don't cause a brief loading flash.
   useEffect(() => {
     if (!selectedLanguage || isMobile) return;
     const worker = workerRef.current;
     if (!worker) return;
-    if (status !== "idle") return; // already loading / ready / transcribing
+    // Only send a load request when truly idle (never loaded yet).
+    // If the model is already ready/loaded, changing language doesn't
+    // require reloading — Whisper language is passed per-transcription call.
+    if (status !== "idle") return;
     const loadRequest: WorkerRequest = { type: "load" };
     worker.postMessage(loadRequest);
   }, [selectedLanguage, isMobile, status]);
@@ -1109,7 +1114,7 @@ export default function Home() {
             >
               {selectedLanguage ? (
                 <>
-                  <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>
+                  <span className="text-base leading-none">
                     {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.flag ?? ""}
                   </span>
                   {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.label}
@@ -1150,7 +1155,7 @@ export default function Home() {
                         : "text-neutral-200 hover:bg-neutral-800",
                     ].join(" ")}
                   >
-                    <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>{option.flag}</span>
+                    <span className="text-base leading-none">{option.flag}</span>
                     {option.label}
                   </button>
                 ))}
