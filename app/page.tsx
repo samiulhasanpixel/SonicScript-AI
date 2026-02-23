@@ -1503,33 +1503,33 @@ export default function Home() {
                   <div
                     role="menu"
                     aria-label="Smart export actions"
-                    className="absolute right-0 z-20 mt-2 w-56 rounded-lg border border-white/10 bg-neutral-900 p-1 shadow-xl"
+                    className="absolute right-0 z-20 mt-2 min-w-max rounded-lg border border-white/10 bg-neutral-900 p-1 shadow-xl"
                   >
                     <button
                       type="button"
                       role="menuitem"
                       onClick={() => void handleSmartExport("copy_text_only")}
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
+                      className="flex w-full items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
                     >
-                      <Copy className="size-3.5" />
+                      <Copy className="size-3.5 shrink-0" />
                       Copy Text Only
                     </button>
                     <button
                       type="button"
                       role="menuitem"
                       onClick={() => void handleSmartExport("copy_with_timestamps")}
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
+                      className="flex w-full items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
                     >
-                      <Clock3 className="size-3.5" />
+                      <Clock3 className="size-3.5 shrink-0" />
                       Copy with Timestamps
                     </button>
                     <button
                       type="button"
                       role="menuitem"
                       onClick={() => void handleSmartExport("export_json")}
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
+                      className="flex w-full items-center gap-2 whitespace-nowrap rounded-md px-2.5 py-2 text-left text-xs text-neutral-200 transition-colors hover:bg-neutral-800"
                     >
-                      <FileJson className="size-3.5" />
+                      <FileJson className="size-3.5 shrink-0" />
                       Export to JSON
                     </button>
                   </div>
