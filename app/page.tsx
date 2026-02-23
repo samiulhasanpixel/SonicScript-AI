@@ -998,14 +998,21 @@ export default function Home() {
   // During model preloading (status === "loading", activeFileName === null) we keep the dropzone visible.
   const uploadBusy = busy && activeFileName !== null;
   /** True once the model pipeline is loaded and ready to transcribe. */
-  // Also treat as ready if model was previously cached AND we're only in the brief
-  // reinitialise phase (no actual download happening) — this hides the flash on page refresh.
+  // Suppress the loading UI on page-refresh if the model was previously cached.
+  // Only show the loading UI again if bytes are actually being transferred
+  // (i.e. the browser cache was cleared and a real re-download is happening).
+  const isActuallyDownloading =
+    progressPhase === "download" &&
+    typeof totalBytes === "number" &&
+    totalBytes > 0 &&
+    typeof downloadedBytes === "number" &&
+    downloadedBytes > 0;
   const modelReady =
     status === "ready" ||
     status === "transcribing" ||
     status === "decoding" ||
     isMobile ||
-    (wasModelEverLoaded && status === "loading" && progressPhase !== "download");
+    (wasModelEverLoaded && status === "loading" && !isActuallyDownloading);
   const isCompiling = status === "loading" && loadingDetail === "compiling";
   /** True between "transcribing" status and the very first chunk_callback firing. */
   const isWarmingUp =
