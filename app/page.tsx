@@ -1063,13 +1063,24 @@ export default function Home() {
               <rect x="18" y="14" width="10" height="2" rx="1" fill="white" className="fill-white" />
               <rect x="18" y="18" width="7" height="2" rx="1" fill="white" className="fill-white" />
             </svg>
-            <h1 className="text-3xl font-bold tracking-tight text-white sm:text-5xl">
-              Audio Transcription Tool
-            </h1>
+            <div>
+              <div className="mb-1.5 flex items-center gap-2">
+                <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-xs font-semibold text-emerald-300">
+                  <svg xmlns="http://www.w3.org/2000/svg" height="11px" viewBox="0 -960 960 960" width="11px" fill="currentColor"><path d="m382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z" /></svg>
+                  100% Free
+                </span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-xs font-medium text-neutral-400">
+                  No sign-up required
+                </span>
+              </div>
+              <h1 className="text-3xl font-bold tracking-tight text-white sm:text-5xl">
+                Audio Transcription Tool
+              </h1>
+            </div>
           </div>
           <p className="max-w-2xl text-sm leading-6 text-neutral-300 sm:text-base">
-            Upload lecture or meeting audio and generate transcripts directly in your browser.
-            {isMobile ? " Secure cloud processing for mobile devices." : " No server uploads, no third-party processing."}
+            Free audio-to-text transcription powered by Whisper AI — runs directly in your browser.
+            {isMobile ? " Secure cloud processing for mobile devices." : " No server uploads, no accounts, no limits."}
           </p>
         </header>
 
