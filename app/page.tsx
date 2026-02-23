@@ -1070,22 +1070,20 @@ export default function Home() {
           <div className="flex flex-1 flex-col p-5">
             <div className={[
               "mb-3 flex items-center gap-2",
-              isMobile ? "text-cyan-400" : !gpuSupported ? "text-amber-400" : "text-neutral-300"
+              isMobile ? "text-cyan-400" : "text-neutral-300"
             ].join(" ")}>
               <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M320-120v-80H160q-33 0-56.5-23.5T80-280v-480q0-33 23.5-56.5T160-840h640q33 0 56.5 23.5T880-760v480q0 33-23.5 56.5T800-200H640v80H320ZM160-280h640v-480H160v480Zm0 0v-480 480Z" /></svg>
               <h3 className={[
                 "text-sm font-medium",
-                isMobile ? "text-cyan-200" : !gpuSupported ? "text-amber-200" : "text-neutral-200"
+                isMobile ? "text-cyan-200" : "text-neutral-200"
               ].join(" ")}>
-                {isMobile ? "Now available on mobile" : !gpuSupported ? "Desktop recommended" : "Best on desktop"}
+                {isMobile ? "Works great on mobile" : "Works on desktop & mobile"}
               </h3>
             </div>
             <p className="text-xs leading-relaxed text-neutral-400">
               {isMobile
-                ? "Mobile uploads are securely processed via Groq Cloud (Whisper Large V3) for maximum speed and battery savings."
-                : !gpuSupported
-                  ? "WebGPU is not supported here. Transcription will fall back to CPU and may be slow."
-                  : "Use Chrome or Edge on a desktop PC for best performance. Keep this tab active."}
+                ? "Full transcription support via Groq Cloud — fast, accurate, and battery friendly."
+                : "Use Chrome or Edge on desktop for local WebGPU processing. On mobile, Groq Cloud handles everything automatically."}
             </p>
           </div>
         </div>
