@@ -100,6 +100,14 @@ const LANGUAGE_OPTIONS: LanguageOption[] = [
   { value: "korean", label: "Korean", flag: "🇰🇷" },
 ];
 
+const TARGET_SAMPLE_RATE = 16_000;
+const LOCAL_CHUNK_LENGTH_S = 30;
+const LOCAL_STRIDE_LENGTH_S = 5;
+const LOCAL_AUDIO_STEP_S = LOCAL_CHUNK_LENGTH_S - 2 * LOCAL_STRIDE_LENGTH_S;
+const CLOUD_CHUNK_DURATION_S = 60;
+const MAX_CLOUD_DIRECT_UPLOAD_BYTES = 3 * 1024 * 1024;
+const MAX_CLOUD_CHUNK_UPLOAD_BYTES = 4 * 1024 * 1024;
+
 function clampProgress(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
@@ -158,11 +166,11 @@ async function decodeAudioFile(file: File): Promise<Float32Array> {
     throw new Error("Web Audio API is not supported in this browser.");
   }
 
-  const audioContext = new AudioContextClass({ sampleRate: 16_000 });
+  const audioContext = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
   try {
     const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
     const mono = downmixToMono(audioBuffer);
-    return resampleMonoAudio(mono, audioBuffer.sampleRate, 16_000);
+    return resampleMonoAudio(mono, audioBuffer.sampleRate, TARGET_SAMPLE_RATE);
   } finally {
     await audioContext.close();
   }
@@ -179,10 +187,44 @@ async function decodeAudioFileForCloudChunking(file: File): Promise<{ samples: F
   try {
     const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
     const mono = downmixToMono(audioBuffer);
-    const sampleRate = Math.max(8_000, Math.round(audioBuffer.sampleRate || 16_000));
-    return { samples: mono, sampleRate };
+    const resampled = resampleMonoAudio(mono, audioBuffer.sampleRate, TARGET_SAMPLE_RATE);
+    return { samples: resampled, sampleRate: TARGET_SAMPLE_RATE };
   } finally {
     await audioContext.close();
+  }
+}
+
+async function getAudioDurationSeconds(file: File): Promise<number | null> {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    return await new Promise<number | null>((resolve) => {
+      const audio = document.createElement("audio");
+      audio.preload = "metadata";
+      audio.src = objectUrl;
+
+      const onLoaded = () => {
+        const duration = audio.duration;
+        audio.removeEventListener("loadedmetadata", onLoaded);
+        audio.removeEventListener("error", onError);
+        if (Number.isFinite(duration) && duration > 0) {
+          resolve(duration);
+          return;
+        }
+        resolve(null);
+      };
+
+      const onError = () => {
+        audio.removeEventListener("loadedmetadata", onLoaded);
+        audio.removeEventListener("error", onError);
+        resolve(null);
+      };
+
+      audio.addEventListener("loadedmetadata", onLoaded);
+      audio.addEventListener("error", onError);
+      audio.load();
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
   }
 }
 
@@ -281,6 +323,7 @@ export default function Home() {
   const [activeDevice, setActiveDevice] = useState<"webgpu" | "wasm" | null>(null);
   const [currentSlice, setCurrentSlice] = useState<number | null>(null);
   const [totalSlices, setTotalSlices] = useState<number | null>(null);
+  const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [warmUpElapsed, setWarmUpElapsed] = useState(0);
   const [isMobile, setIsMobile] = useState(false);
   const [gpuSupported, setGpuSupported] = useState(true);
@@ -341,6 +384,7 @@ export default function Home() {
     setLoadingDetail(null);
     setCurrentSlice(null);
     setTotalSlices(null);
+    setAudioDurationSeconds(null);
     transcribeStartedAtRef.current = null;
   }, []);
 
@@ -727,27 +771,38 @@ export default function Home() {
           };
 
           // Vercel serverless functions have a ~4.5 MB request body limit.
-          // Files above 3 MB are decoded locally and sent as 60-second WAV
-          // chunks (~1.9 MB each) to stay safely under that limit.
-          const MAX_FILE_SIZE = 3 * 1024 * 1024; // 3 MB
+          // Files above 3 MB are decoded locally and uploaded as 16 kHz mono WAV chunks.
           let chunksToProcess: { blob: Blob; offsetS: number }[] = [];
 
-          if (file.size <= MAX_FILE_SIZE) {
+          if (file.size <= MAX_CLOUD_DIRECT_UPLOAD_BYTES) {
             chunksToProcess = [{ blob: file, offsetS: 0 }];
             setTotalChunks(1);
+            void getAudioDurationSeconds(file).then((duration) => {
+              if (requestId !== activeRequestIdRef.current) return;
+              if (duration === null) return;
+              setAudioDurationSeconds(Math.max(1, Math.round(duration)));
+            });
           } else {
             setLoadingDetail("Preparing audio for upload...");
             setStatus("decoding"); // visually update
             const { samples: audioData, sampleRate } = await decodeAudioFileForCloudChunking(file);
 
             setStatus("transcribing"); // back to transcribing
+            setAudioDurationSeconds(Math.max(1, Math.round(audioData.length / sampleRate)));
 
-            // 60 s WAV chunks are uploaded sequentially to stay under Vercel body limits.
-            const CHUNK_DURATION_S = 60;
-            const SAMPLES_PER_CHUNK = CHUNK_DURATION_S * sampleRate;
+            // Keep each WAV chunk safely below the server body limit.
+            const desiredSamplesPerChunk = CLOUD_CHUNK_DURATION_S * sampleRate;
+            const maxSamplesPerChunk = Math.max(
+              1,
+              Math.floor((MAX_CLOUD_CHUNK_UPLOAD_BYTES - 44) / 2),
+            );
+            const samplesPerChunk = Math.max(
+              1,
+              Math.min(desiredSamplesPerChunk, maxSamplesPerChunk),
+            );
 
-            for (let i = 0; i < audioData.length; i += SAMPLES_PER_CHUNK) {
-              const chunkData = audioData.slice(i, i + SAMPLES_PER_CHUNK);
+            for (let i = 0; i < audioData.length; i += samplesPerChunk) {
+              const chunkData = audioData.slice(i, i + samplesPerChunk);
               const wavBlob = encodeWAV(chunkData, sampleRate);
               chunksToProcess.push({ blob: wavBlob, offsetS: i / sampleRate });
             }
@@ -768,6 +823,8 @@ export default function Home() {
             if (requestId !== activeRequestIdRef.current) return;
 
             const result = await transcribeCloudBlob(blob, `chunk-${i}.wav`);
+            setProcessedChunks(i + 1);
+            setProgress(((i + 1) / chunksToProcess.length) * 100);
 
             combinedText += (combinedText ? " " : "") + (result.text || "").trim();
 
@@ -810,6 +867,7 @@ export default function Home() {
       try {
         const audioData = await decodeAudioFile(file);
         if (requestId !== activeRequestIdRef.current) return;
+        setAudioDurationSeconds(Math.max(1, Math.round(audioData.length / TARGET_SAMPLE_RATE)));
 
         const request: WorkerRequest = {
           type: "transcribe",
@@ -951,6 +1009,22 @@ export default function Home() {
     ],
   );
 
+  const totalAudioSeconds = useMemo(() => {
+    if (audioDurationSeconds !== null) {
+      return audioDurationSeconds;
+    }
+
+    if (totalChunks === null || totalChunks <= 0) {
+      return null;
+    }
+
+    if (isMobile) {
+      return totalChunks * CLOUD_CHUNK_DURATION_S;
+    }
+
+    return Math.round((totalChunks - 1) * LOCAL_AUDIO_STEP_S + LOCAL_CHUNK_LENGTH_S);
+  }, [audioDurationSeconds, isMobile, totalChunks]);
+
   const progressLabel = useMemo(() => {
     if (progressPhase === "download") {
       if (downloadedBytes !== null && totalBytes !== null && totalBytes > 0) {
@@ -963,11 +1037,16 @@ export default function Home() {
       return `Downloading model\u2026 ${pct}%`;
     }
     if (progressPhase === "transcribing") {
-      // Processed audio time: each 30-s chunk with 10-s jump = 20 s of new audio per chunk
       const processedAudioSec =
-        processedChunks !== null ? Math.round(processedChunks * 20) : null;
-      const totalAudioSec =
-        totalChunks !== null ? Math.round((totalChunks - 1) * 20 + 30) : null;
+        processedChunks !== null
+          ? Math.round(
+            processedChunks * (isMobile ? CLOUD_CHUNK_DURATION_S : LOCAL_AUDIO_STEP_S),
+          )
+          : null;
+      const clampedProcessedAudioSec =
+        processedAudioSec !== null && totalAudioSeconds !== null
+          ? Math.min(processedAudioSec, totalAudioSeconds)
+          : processedAudioSec;
 
       const fmtMin = (s: number) => {
         const m = Math.floor(s / 60);
@@ -976,8 +1055,8 @@ export default function Home() {
       };
 
       const timeStr =
-        processedAudioSec !== null && totalAudioSec !== null
-          ? `${fmtMin(processedAudioSec)} / ${fmtMin(totalAudioSec)} transcribed`
+        clampedProcessedAudioSec !== null && totalAudioSeconds !== null
+          ? `${fmtMin(clampedProcessedAudioSec)} / ${fmtMin(totalAudioSeconds)} transcribed`
           : null;
 
       const sliceStr =
@@ -990,16 +1069,11 @@ export default function Home() {
       return [sliceStr, timeStr, pctStr].filter(Boolean).join("  ·  ");
     }
     return "";
-  }, [currentSlice, downloadedBytes, processedChunks, progress, progressPhase, totalBytes, totalChunks, totalSlices]);
+  }, [currentSlice, downloadedBytes, isMobile, processedChunks, progress, progressPhase, totalAudioSeconds, totalBytes, totalSlices]);
 
-  /**
-   * Rough audio duration in minutes derived from total chunk count.
-   * Each chunk advances by (CHUNK_LENGTH_S - 2 * STRIDE_LENGTH_S) = 20 s,
-   * so total audio ≈ (chunks − 1) × 20s + 30s.
-   */
   const roughAudioMinutes =
-    totalChunks !== null && totalChunks > 0
-      ? Math.round(((totalChunks - 1) * 20 + 30) / 60)
+    totalAudioSeconds !== null
+      ? Math.round(totalAudioSeconds / 60)
       : null;
 
   const etaLabel = useMemo(() => {
@@ -1009,16 +1083,19 @@ export default function Home() {
     // show a rough estimate from audio duration instead of "calculating..."
     if (etaSeconds === null) {
       if (roughAudioMinutes !== null && roughAudioMinutes > 0) {
-        // whisper-small on WebGPU processes roughly 3–5× real-time
-        const low = Math.max(1, Math.round(roughAudioMinutes / 5));
-        const high = Math.max(2, Math.round(roughAudioMinutes / 2));
+        const low = isMobile
+          ? Math.max(1, Math.round(roughAudioMinutes / 15))
+          : Math.max(1, Math.round(roughAudioMinutes / 5));
+        const high = isMobile
+          ? Math.max(2, Math.round(roughAudioMinutes / 6))
+          : Math.max(2, Math.round(roughAudioMinutes / 2));
         return `Audio length ~${roughAudioMinutes} min — estimated processing time: ${low}–${high} min`;
       }
       return "Estimated time: calculating...";
     }
     if (etaSeconds <= 0) return "Estimated time: finishing...";
     return `Estimated remaining: ${formatSegmentTimestamp(etaSeconds)}`;
-  }, [etaSeconds, progressPhase, roughAudioMinutes]);
+  }, [etaSeconds, isMobile, progressPhase, roughAudioMinutes]);
 
   const busy =
     status === "loading" || status === "decoding" || status === "transcribing" || isCancelling;
@@ -1044,6 +1121,7 @@ export default function Home() {
   const isCompiling = status === "loading" && loadingDetail === "compiling";
   /** True between "transcribing" status and the very first chunk_callback firing. */
   const isWarmingUp =
+    !isMobile &&
     status === "transcribing" &&
     processedChunks === 0 &&
     totalChunks !== null &&
