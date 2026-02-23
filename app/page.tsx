@@ -168,6 +168,39 @@ async function decodeAudioFile(file: File): Promise<Float32Array> {
   }
 }
 
+function encodeWAV(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (view: DataView, offset: number, string: string) => {
+    for (let i = 0; i < string.length; i += 1) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  };
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // 1 channel
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate (sampleRate * block align)
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 function timestampForFilename(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0");
   const year = date.getFullYear();
@@ -202,6 +235,7 @@ export default function Home() {
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const langMenuRef = useRef<HTMLDivElement | null>(null);
   const transcribeStartedAtRef = useRef<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [status, setStatus] = useState<TranscriptionStatus>("idle");
   const [progress, setProgress] = useState(0);
@@ -232,6 +266,7 @@ export default function Home() {
   const [warmUpElapsed, setWarmUpElapsed] = useState(0);
   const [isMobile, setIsMobile] = useState(false);
   const [gpuSupported, setGpuSupported] = useState(true);
+  const [isViaCloud, setIsViaCloud] = useState(false);
 
   useEffect(() => {
     setIsMobile(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
@@ -243,13 +278,13 @@ export default function Home() {
   // user later drops a file the model is already ready (or still
   // downloading — in which case the transcribe request just awaits).
   useEffect(() => {
-    if (!selectedLanguage) return;
+    if (!selectedLanguage || isMobile) return;
     const worker = workerRef.current;
     if (!worker) return;
     if (status !== "idle") return; // already loading / ready / transcribing
     const loadRequest: WorkerRequest = { type: "load" };
     worker.postMessage(loadRequest);
-  }, [selectedLanguage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedLanguage, isMobile, status]);
 
 
 
@@ -451,10 +486,18 @@ export default function Home() {
     setError(null);
     clearProgressState();
 
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      setIsViaCloud(false);
+      setStatus("ready");
+      setActiveFileName(null);
+    }
+
     const isModelLoaded =
       status === "ready" || status === "transcribing" || status === "decoding";
 
-    if (isModelLoaded) {
+    if (isModelLoaded && !isViaCloud) {
       // Model is already in memory — just abort the running transcription.
       // No need to kill the worker; the loaded pipeline stays intact.
       if (workerRef.current) {
@@ -592,11 +635,13 @@ export default function Home() {
         cancelTranscription();
       }
 
-      const worker = workerRef.current;
-      if (!worker) {
-        setStatus("error");
-        setError("Transcription worker is not available.");
-        return;
+      if (!isMobile) {
+        const worker = workerRef.current;
+        if (!worker) {
+          setStatus("error");
+          setError("Transcription worker is not available.");
+          return;
+        }
       }
 
       const requestId = activeRequestIdRef.current + 1;
@@ -610,8 +655,111 @@ export default function Home() {
       setCopyFeedback(null);
       setIsExportMenuOpen(false);
       setError(null);
-      setStatus("decoding");
       clearProgressState();
+
+      if (isMobile) {
+        setIsViaCloud(true);
+        setStatus("transcribing");
+        setProgressPhase("transcribing");
+        setLoadingDetail("Uploading to Cloud...");
+        setProgress(0);
+
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+
+        try {
+          const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
+          let chunksToProcess: { blob: Blob; offsetS: number }[] = [];
+
+          if (file.size <= MAX_FILE_SIZE) {
+            chunksToProcess = [{ blob: file, offsetS: 0 }];
+            setTotalChunks(1);
+          } else {
+            setLoadingDetail("File too large, chunking audio locally...");
+            setStatus("decoding"); // visually update
+            const audioData = await decodeAudioFile(file);
+            setStatus("transcribing"); // back to transcribing
+
+            const CHUNK_DURATION_S = 10 * 60; // 10 minutes
+            const SAMPLES_PER_CHUNK = CHUNK_DURATION_S * 16000;
+
+            for (let i = 0; i < audioData.length; i += SAMPLES_PER_CHUNK) {
+              const chunkData = audioData.slice(i, i + SAMPLES_PER_CHUNK);
+              const wavBlob = encodeWAV(chunkData, 16000);
+              chunksToProcess.push({ blob: wavBlob, offsetS: i / 16000 });
+            }
+            setTotalChunks(chunksToProcess.length);
+          }
+
+          let combinedText = "";
+          const combinedSegments: TranscriptSegment[] = [];
+
+          for (let i = 0; i < chunksToProcess.length; i++) {
+            if (abortControllerRef.current?.signal.aborted) break;
+
+            const { blob, offsetS } = chunksToProcess[i];
+            setLoadingDetail(`Uploading chunk ${i + 1} of ${chunksToProcess.length}...`);
+            setProcessedChunks(i);
+            setProgress((i / chunksToProcess.length) * 100);
+
+            const formData = new FormData();
+            formData.append("file", blob, `chunk-${i}.wav`);
+            if (selectedLanguage && selectedLanguage !== "auto") {
+              formData.append("language", selectedLanguage);
+            }
+
+            const response = await fetch("/api/transcribe", {
+              method: "POST",
+              body: formData,
+              signal: controller.signal,
+            });
+
+            if (!response.ok) {
+              const data = await response.json().catch(() => ({}));
+              throw new Error(data.error || "Cloud transcription failed.");
+            }
+
+            if (requestId !== activeRequestIdRef.current) return;
+
+            const result = await response.json();
+
+            combinedText += (combinedText ? " " : "") + (result.text || "").trim();
+
+            if (result.segments) {
+              for (const seg of result.segments) {
+                combinedSegments.push({
+                  text: seg.text,
+                  start: seg.start + offsetS,
+                  end: seg.end + offsetS,
+                });
+              }
+            }
+          }
+
+          if (abortControllerRef.current?.signal.aborted) return;
+          if (requestId !== activeRequestIdRef.current) return;
+
+          setProgress(100);
+          setProcessedChunks(chunksToProcess.length);
+          setOutput(combinedText);
+          setSegments(combinedSegments);
+          setStatus("ready");
+          setProgressPhase(null);
+          setIsViaCloud(false);
+          abortControllerRef.current = null;
+
+        } catch (cloudError: unknown) {
+          if (cloudError instanceof Error && cloudError.name === "AbortError") return;
+          if (requestId !== activeRequestIdRef.current) return;
+          setStatus("error");
+          setError(cloudError instanceof Error ? cloudError.message : "Cloud transcription failed.");
+          setIsViaCloud(false);
+          abortControllerRef.current = null;
+        }
+        return;
+      }
+
+      setStatus("decoding");
 
       try {
         const audioData = await decodeAudioFile(file);
@@ -623,7 +771,7 @@ export default function Home() {
           audio: audioData,
           language: selectedLanguage ?? "english",
         };
-        worker.postMessage(request, [audioData.buffer]);
+        workerRef.current?.postMessage(request, [audioData.buffer]);
       } catch (decodeError) {
         if (requestId !== activeRequestIdRef.current) return;
         setStatus("error");
@@ -634,7 +782,7 @@ export default function Home() {
         );
       }
     },
-    [cancelTranscription, clearProgressState, selectedLanguage, status],
+    [cancelTranscription, clearProgressState, isMobile, selectedLanguage, status],
   );
 
   const handleFileSelected = useCallback(
@@ -832,7 +980,7 @@ export default function Home() {
   // During model preloading (status === "loading", activeFileName === null) we keep the dropzone visible.
   const uploadBusy = busy && activeFileName !== null;
   /** True once the model pipeline is loaded and ready to transcribe. */
-  const modelReady = status === "ready" || status === "transcribing" || status === "decoding";
+  const modelReady = status === "ready" || status === "transcribing" || status === "decoding" || isMobile;
   const isCompiling = status === "loading" && loadingDetail === "compiling";
   /** True between "transcribing" status and the very first chunk_callback firing. */
   const isWarmingUp =
@@ -889,7 +1037,7 @@ export default function Home() {
           </div>
           <p className="max-w-2xl text-sm leading-6 text-neutral-300 sm:text-base">
             Upload lecture or meeting audio and generate transcripts directly in your browser.
-            No server uploads, no third-party processing.
+            {isMobile ? " Secure cloud processing for mobile devices." : " No server uploads, no third-party processing."}
           </p>
         </header>
 
@@ -898,285 +1046,159 @@ export default function Home() {
           <div className="flex flex-1 flex-col p-5">
             <div className="mb-3 flex items-center gap-2 text-neutral-300">
               <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M320-240q-33 0-56.5-23.5T240-320v-320q0-33 23.5-56.5T320-720h320q33 0 56.5 23.5T720-640v320q0 33-23.5 56.5T640-240H320Zm0-80h320v-320H320v320Zm-80 40v-80h-80v-80h80v-80h-80v-80h80v-80h-80v-80h80v-80h80v80h80v-80h80v80h80v-80h80v80h80v80h-80v80h80v80h-80v80h80v80h-80v80h-80v-80h-80v80h-80v-80h-80v80h-80Zm160-240h160v-160H400v160Zm0-80h160v-160H400v160Z" /></svg>
-              <h3 className="text-sm font-medium text-neutral-200">Runs in your browser</h3>
+              <h3 className="text-sm font-medium text-neutral-200">{isMobile ? "Hybrid Intelligence" : "Runs in your browser"}</h3>
             </div>
             <p className="text-xs leading-relaxed text-neutral-400">
-              Powered by Whisper Small via WebGPU. No internet connection required after the initial model load.
+              {isMobile
+                ? "Switching seamlessly between on-device decoding and cloud transcription for the best mobile experience."
+                : "Powered by Whisper Small via WebGPU. No internet connection required after the initial model load."}
             </p>
           </div>
 
           <div className="flex flex-1 flex-col p-5">
             <div className="mb-3 flex items-center gap-2 text-neutral-300">
               <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M240-80q-33 0-56.5-23.5T160-160v-400q0-33 23.5-56.5T240-640h40v-80q0-83 58.5-141.5T480-920q83 0 141.5 58.5T680-720v80h40q33 0 56.5 23.5T800-560v400q0 33-23.5 56.5T720-80H240Zm0-80h480v-400H240v400Zm240-120q33 0 56.5-23.5T560-360q0-33-23.5-56.5T480-440q-33 0-56.5 23.5T400-360q0 33 23.5 56.5T480-280ZM360-640h240v-80q0-50-35-85t-85-35q-50 0-85 35t-35 85v80ZM240-160v-400 400Z" /></svg>
-              <h3 className="text-sm font-medium text-neutral-200">Zero data leaves device</h3>
+              <h3 className="text-sm font-medium text-neutral-200">{isMobile ? "Privacy Conscious" : "Zero data leaves device"}</h3>
             </div>
             <p className="text-xs leading-relaxed text-neutral-400">
-              Your audio is never uploaded to any server. Everything is processed locally with no tracking or storage.
+              {isMobile
+                ? "Audio is securely sent to Groq Cloud for processing and deleted immediately. No personal data is stored."
+                : "Your audio is never uploaded to any server. Everything is processed locally with no tracking or storage."}
             </p>
           </div>
 
           <div className="flex flex-1 flex-col p-5">
             <div className={[
               "mb-3 flex items-center gap-2",
-              isMobile || !gpuSupported ? "text-amber-400" : "text-neutral-300"
+              isMobile ? "text-cyan-400" : !gpuSupported ? "text-amber-400" : "text-neutral-300"
             ].join(" ")}>
               <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M320-120v-80H160q-33 0-56.5-23.5T80-280v-480q0-33 23.5-56.5T160-840h640q33 0 56.5 23.5T880-760v480q0 33-23.5 56.5T800-200H640v80H320ZM160-280h640v-480H160v480Zm0 0v-480 480Z" /></svg>
               <h3 className={[
                 "text-sm font-medium",
-                isMobile || !gpuSupported ? "text-amber-200" : "text-neutral-200"
+                isMobile ? "text-cyan-200" : !gpuSupported ? "text-amber-200" : "text-neutral-200"
               ].join(" ")}>
-                {isMobile || !gpuSupported ? "Desktop recommended" : "Best on desktop"}
+                {isMobile ? "Now available on mobile" : !gpuSupported ? "Desktop recommended" : "Best on desktop"}
               </h3>
             </div>
             <p className="text-xs leading-relaxed text-neutral-400">
-              {isMobile || !gpuSupported
-                ? "WebGPU is not supported here. Transcription will fall back to CPU and may be slow."
-                : "Use Chrome or Edge on a desktop PC for best performance. Keep this tab active."}
+              {isMobile
+                ? "Mobile uploads are securely processed via Groq Cloud (Whisper Large V3) for maximum speed and battery savings."
+                : !gpuSupported
+                  ? "WebGPU is not supported here. Transcription will fall back to CPU and may be slow."
+                  : "Use Chrome or Edge on a desktop PC for best performance. Keep this tab active."}
             </p>
           </div>
         </div>
 
-            <div className="mb-4">
-              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                Step 1 — Select the audio language
-              </p>
-              <div
-                ref={langMenuRef}
-                className={["relative inline-block", isLangShaking ? "lang-shake" : ""].join(" ")}
-                onAnimationEnd={() => setIsLangShaking(false)}
-              >
-                <button
-                  type="button"
-                  onClick={() => setIsLangMenuOpen((prev) => !prev)}
-                  className={[
-                    "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium outline-none transition-colors",
-                    selectedLanguage
-                      ? "border-cyan-400/40 bg-cyan-400/5 text-neutral-200 hover:bg-cyan-400/10"
-                      : "border-dashed border-white/20 bg-neutral-900/60 text-neutral-400 hover:border-white/40 hover:text-neutral-200",
-                  ].join(" ")}
-                >
-                  {selectedLanguage ? (
-                    <>
-                      <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>
-                        {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.flag ?? ""}
-                      </span>
-                      {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.label}
-                    </>
-                  ) : (
-                    <>
-                      <svg xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="currentColor"><path d="m476-80 182-480h84L924-80h-84l-43-122H603L560-80h-84ZM160-200l-56-56 202-202q-35-35-63.5-80T190-640h84q20 39 40 68t48 58q33-33 68.5-92.5T484-720H40v-80h280v-80h80v80h280v80H564q-21 72-63 148t-83 116l96 98-30 82-97-99-202 195Zm468-72h144l-72-204-72 204Z" /></svg>
-                      Select audio language
-                    </>
-                  )}
-                  <ChevronDown
-                    className={[
-                      "size-3.5 transition-transform",
-                      isLangMenuOpen ? "rotate-180" : "",
-                    ].join(" ")}
-                  />
-                </button>
-
-                {isLangMenuOpen ? (
-                  <div
-                    role="listbox"
-                    className="absolute left-0 z-20 mt-2 w-48 rounded-lg border border-white/10 bg-neutral-900 p-1 shadow-xl"
-                  >
-                    {LANGUAGE_OPTIONS.map((option) => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        role="option"
-                        aria-selected={selectedLanguage === option.value}
-                        onClick={() => {
-                          setSelectedLanguage(option.value as "auto" | WhisperLanguage);
-                          setIsLangMenuOpen(false);
-                        }}
-                        className={[
-                          "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors",
-                          selectedLanguage === option.value
-                            ? "bg-cyan-400/15 text-cyan-200"
-                            : "text-neutral-200 hover:bg-neutral-800",
-                        ].join(" ")}
-                      >
-                        <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>{option.flag}</span>
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-
-            {/* Step 2 — Load AI model (hidden once ready) */}
-            {!modelReady && (
-            <div
-              className={["mb-4", isModelShaking ? "model-shake" : ""].join(" ")}
-              onAnimationEnd={() => setIsModelShaking(false)}
+        <div className="mb-4">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
+            Step 1 — Select the audio language
+          </p>
+          <div
+            ref={langMenuRef}
+            className={["relative inline-block", isLangShaking ? "lang-shake" : ""].join(" ")}
+            onAnimationEnd={() => setIsLangShaking(false)}
+          >
+            <button
+              type="button"
+              onClick={() => setIsLangMenuOpen((prev) => !prev)}
+              className={[
+                "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium outline-none transition-colors",
+                selectedLanguage
+                  ? "border-cyan-400/40 bg-cyan-400/5 text-neutral-200 hover:bg-cyan-400/10"
+                  : "border-dashed border-white/20 bg-neutral-900/60 text-neutral-400 hover:border-white/40 hover:text-neutral-200",
+              ].join(" ")}
             >
-              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                Step 2 — Load AI model
-              </p>
-              {!selectedLanguage ? (
-                <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5 opacity-50">
-                  <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor" className="shrink-0 text-neutral-400"><path d="M240-80q-33 0-56.5-23.5T160-160v-400q0-33 23.5-56.5T240-640h40v-80q0-83 58.5-141.5T480-920q83 0 141.5 58.5T680-720v80h40q33 0 56.5 23.5T800-560v400q0 33-23.5 56.5T720-80H240Zm0-80h480v-400H240v400Zm240-120q33 0 56.5-23.5T560-360q0-33-23.5-56.5T480-440q-33 0-56.5 23.5T400-360q0 33 23.5 56.5T480-280ZM480-640h160v-80q0-50-35-85t-85-35q-50 0-85 35t-35 85v80Zm-240 480v-400 400Z"/></svg>
-                  <span className="text-sm text-neutral-400">Select a language first</span>
-                </div>
-              ) : isCompiling ? (
-                <div className="space-y-2 rounded-xl border border-violet-500/20 bg-violet-500/5 p-3">
-                  <p className="text-xs text-violet-300/90">First-time setup — compiling WebGPU shaders. Cached after this run.</p>
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="space-y-0.5">
-                      <p className="text-xs text-neutral-300 sm:text-sm">Preparing GPU kernels… this takes 1–2 minutes on first run.</p>
-                      <p className="text-xs text-neutral-500">You can leave this tab open and wait.</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={cancelTranscription}
-                      disabled={isCancelling}
-                      className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <Square className="size-3.5" />
-                      {isCancelling ? "Cancelling..." : "Cancel"}
-                    </button>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
-                    <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-violet-600/40 via-violet-400 to-violet-600/40 bg-[length:200%_100%]" />
-                  </div>
-                </div>
-              ) : progressPhase === "download" ? (
-                <div className="space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
-                  <div className="flex items-center justify-between gap-4">
-                    <p className="text-xs font-medium text-neutral-200 sm:text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>{progressLabel}</p>
-                    <button
-                      type="button"
-                      onClick={cancelTranscription}
-                      disabled={isCancelling}
-                      className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <Square className="size-3.5" />
-                      {isCancelling ? "Cancelling..." : "Cancel"}
-                    </button>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
-                    <div
-                      className="h-full rounded-full bg-cyan-400 transition-all duration-300"
-                      style={{ width: `${progress}%` }}
-                    />
-                  </div>
-                  {etaLabel ? (
-                    <p className="text-xs text-neutral-500" style={{ fontVariantNumeric: "tabular-nums" }}>{etaLabel}</p>
-                  ) : null}
-                </div>
+              {selectedLanguage ? (
+                <>
+                  <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>
+                    {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.flag ?? ""}
+                  </span>
+                  {LANGUAGE_OPTIONS.find((o) => o.value === selectedLanguage)?.label}
+                </>
               ) : (
-                <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
-                  <svg className="size-4 animate-spin text-neutral-400" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                  </svg>
-                  <span className="text-sm text-neutral-400">Loading model…</span>
-                </div>
+                <>
+                  <svg xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="currentColor"><path d="m476-80 182-480h84L924-80h-84l-43-122H603L560-80h-84ZM160-200l-56-56 202-202q-35-35-63.5-80T190-640h84q20 39 40 68t48 58q33-33 68.5-92.5T484-720H40v-80h280v-80h80v80h280v80H564q-21 72-63 148t-83 116l96 98-30 82-97-99-202 195Zm468-72h144l-72-204-72 204Z" /></svg>
+                  Select audio language
+                </>
               )}
-            </div>
-            )}
+              <ChevronDown
+                className={[
+                  "size-3.5 transition-transform",
+                  isLangMenuOpen ? "rotate-180" : "",
+                ].join(" ")}
+              />
+            </button>
 
-            {/* Step 2/3 — Upload */}
-            {uploadBusy ? (
-              /* While processing: hide the full dropzone, show only the compact file row */
-              <div>
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                  {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
-                </p>
-                <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
-                  <div className="flex min-w-0 items-center gap-2.5">
-                    <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor" className="shrink-0 text-neutral-400"><path d="M560-360v-240l80 80 56-56-160-160-160 160 56 56 80-80v240h48Zm-80 200q-83 0-141.5-58.5T280-360v-400h400v400q0 83-58.5 141.5T480-160Zm0-80q50 0 85-35t35-85v-320H360v320q0 50 35 85t85 35ZM200-80q-33 0-56.5-23.5T120-160v-520h80v520h520v80H200Zm280-440Z" /></svg>
-                    <span className="truncate text-sm text-neutral-200">{activeFileName}</span>
-                  </div>
-                  <span className="shrink-0 text-xs text-neutral-500">Processing…</span>
-                </div>
-              </div>
-            ) : (
-              <div className="relative">
-                <div className={(!selectedLanguage || !modelReady) ? "pointer-events-none opacity-40" : ""}>
-                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                    {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
-                  </p>
-                  <UploadDropzone onFileSelected={handleFileSelected} />
-                </div>
-                {(!selectedLanguage || !modelReady) && (
-                  <div
-                    className="absolute inset-0 cursor-pointer"
+            {isLangMenuOpen ? (
+              <div
+                role="listbox"
+                className="absolute left-0 z-20 mt-2 w-48 rounded-lg border border-white/10 bg-neutral-900 p-1 shadow-xl"
+              >
+                {LANGUAGE_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="option"
+                    aria-selected={selectedLanguage === option.value}
                     onClick={() => {
-                      if (!selectedLanguage) { setIsLangShaking(true); setIsLangMenuOpen(true); }
-                      if (!modelReady) { setIsModelShaking(true); }
+                      setSelectedLanguage(option.value as "auto" | WhisperLanguage);
+                      setIsLangMenuOpen(false);
                     }}
-                  />
-                )}
+                    className={[
+                      "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors",
+                      selectedLanguage === option.value
+                        ? "bg-cyan-400/15 text-cyan-200"
+                        : "text-neutral-200 hover:bg-neutral-800",
+                    ].join(" ")}
+                  >
+                    <span className="text-base leading-none" style={{ fontFamily: '"TwemojiFlags", sans-serif' }}>{option.flag}</span>
+                    {option.label}
+                  </button>
+                ))}
               </div>
-            )}
+            ) : null}
+          </div>
+        </div>
 
-            {isWarmingUp ? (
-              <div className="mt-3 rounded-xl border border-cyan-500/20 bg-neutral-950/60 p-4 shadow-inner">
-                {/* Header row */}
-                <div className="flex items-start justify-between gap-4">
+        {/* Step 2 — Load AI model (hidden once ready) */}
+        {!modelReady && (
+          <div
+            className={["mb-4", isModelShaking ? "model-shake" : ""].join(" ")}
+            onAnimationEnd={() => setIsModelShaking(false)}
+          >
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
+              Step 2 — Load AI model
+            </p>
+            {!selectedLanguage ? (
+              <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5 opacity-50">
+                <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor" className="shrink-0 text-neutral-400"><path d="M240-80q-33 0-56.5-23.5T160-160v-400q0-33 23.5-56.5T240-640h40v-80q0-83 58.5-141.5T480-920q83 0 141.5 58.5T680-720v80h40q33 0 56.5 23.5T800-560v400q0 33-23.5 56.5T720-80H240Zm0-80h480v-400H240v400Zm240-120q33 0 56.5-23.5T560-360q0-33-23.5-56.5T480-440q-33 0-56.5 23.5T400-360q0 33 23.5 56.5T480-280ZM480-640h160v-80q0-50-35-85t-85-35q-50 0-85 35t-35 85v80Zm-240 480v-400 400Z" /></svg>
+                <span className="text-sm text-neutral-400">Select a language first</span>
+              </div>
+            ) : isCompiling ? (
+              <div className="space-y-2 rounded-xl border border-violet-500/20 bg-violet-500/5 p-3">
+                <p className="text-xs text-violet-300/90">First-time setup — compiling WebGPU shaders. Cached after this run.</p>
+                <div className="flex items-center justify-between gap-4">
                   <div className="space-y-0.5">
-                    <p className="text-sm font-semibold text-neutral-100">
-                      Transcription in progress
-                    </p>
-                    <p className="text-xs text-neutral-400">
-                      Initial segment processing — the GPU is warming up. This takes 30–90 s the first time.
-                    </p>
+                    <p className="text-xs text-neutral-300 sm:text-sm">Preparing GPU kernels… this takes 1–2 minutes on first run.</p>
+                    <p className="text-xs text-neutral-500">You can leave this tab open and wait.</p>
                   </div>
                   <button
                     type="button"
                     onClick={cancelTranscription}
                     disabled={isCancelling}
-                    className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     <Square className="size-3.5" />
-                    {isCancelling ? "Cancelling…" : "Cancel"}
+                    {isCancelling ? "Cancelling..." : "Cancel"}
                   </button>
                 </div>
-
-                {/* Stats row */}
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <span className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-xs font-medium tabular-nums text-cyan-300">
-                    <Clock3 className="size-3.5" style={{ animationDuration: "3s" }} />
-                    {warmUpElapsed}s elapsed
-                  </span>
-
-                  {totalSlices !== null && totalSlices > 1 && currentSlice !== null ? (
-                    <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-400">
-                      Slice {currentSlice} / {totalSlices}
-                    </span>
-                  ) : null}
-
-                  {totalChunks !== null ? (
-                    <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-400">
-                      0 / {totalChunks} segments
-                    </span>
-                  ) : null}
-
-                  {roughAudioMinutes !== null ? (
-                    <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-500">
-                      ~{roughAudioMinutes} min audio
-                    </span>
-                  ) : null}
+                <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
+                  <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-violet-600/40 via-violet-400 to-violet-600/40 bg-[length:200%_100%]" />
                 </div>
-
-                {/* Activity bar */}
-                <div className="mt-3 h-1 overflow-hidden rounded-full bg-neutral-800">
-                  <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-cyan-600/50 via-cyan-400 to-cyan-600/50 bg-[length:200%_100%]" />
-                </div>
-
-                <p className="mt-2 text-xs text-neutral-600">
-                  Keep this tab active while processing.
-                </p>
               </div>
-            ) : null}
-
-            {showProgressBar ? (
-              <div className="mt-3 space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
-                {/* ── Top row: label + cancel ─────────────────────────────────── */}
+            ) : progressPhase === "download" ? (
+              <div className="space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
                 <div className="flex items-center justify-between gap-4">
                   <p className="text-xs font-medium text-neutral-200 sm:text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>{progressLabel}</p>
                   <button
@@ -1189,62 +1211,194 @@ export default function Home() {
                     {isCancelling ? "Cancelling..." : "Cancel"}
                   </button>
                 </div>
-
-                {/* ── Progress bar ────────────────────────────────────────────── */}
                 <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
                   <div
                     className="h-full rounded-full bg-cyan-400 transition-all duration-300"
                     style={{ width: `${progress}%` }}
                   />
                 </div>
-
-                {/* ── Slice pip track (only when there are multiple slices) ───── */}
-                {totalSlices !== null && totalSlices > 1 ? (
-                  <div className="flex items-center gap-1">
-                    {Array.from({ length: totalSlices }).map((_, i) => (
-                      <div
-                        key={i}
-                        className={[
-                          "h-1 flex-1 rounded-full transition-colors duration-300",
-                          currentSlice !== null && i < currentSlice
-                            ? "bg-cyan-400"
-                            : currentSlice !== null && i === currentSlice - 1
-                              ? "bg-cyan-400/60"
-                              : "bg-neutral-700",
-                        ].join(" ")}
-                      />
-                    ))}
-                  </div>
-                ) : null}
-
-                {/* ── ETA row ─────────────────────────────────────────────────── */}
                 {etaLabel ? (
                   <p className="text-xs text-neutral-500" style={{ fontVariantNumeric: "tabular-nums" }}>{etaLabel}</p>
                 ) : null}
               </div>
-            ) : null}
+            ) : (
+              <div className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
+                <svg className="size-4 animate-spin text-neutral-400" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                <span className="text-sm text-neutral-400">Loading model…</span>
+              </div>
+            )}
+          </div>
+        )}
 
-            {status === "decoding" && !showProgressBar ? (
-              <div className="mt-3 flex items-center justify-between rounded-xl border border-white/10 bg-neutral-950/70 p-3">
-                <p className="text-xs text-neutral-300 sm:text-sm">Decoding audio...</p>
-                <button
-                  type="button"
-                  onClick={cancelTranscription}
-                  disabled={isCancelling}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <Square className="size-3.5" />
-                  {isCancelling ? "Cancelling..." : "Cancel"}
-                </button>
+        {/* Step 2/3 — Upload */}
+        {uploadBusy ? (
+          /* While processing: hide the full dropzone, show only the compact file row */
+          <div>
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
+              {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
+            </p>
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-neutral-900/80 px-3.5 py-2.5">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor" className="shrink-0 text-neutral-400"><path d="M560-360v-240l80 80 56-56-160-160-160 160 56 56 80-80v240h48Zm-80 200q-83 0-141.5-58.5T280-360v-400h400v400q0 83-58.5 141.5T480-160Zm0-80q50 0 85-35t35-85v-320H360v320q0 50 35 85t85 35ZM200-80q-33 0-56.5-23.5T120-160v-520h80v520h520v80H200Zm280-440Z" /></svg>
+                <span className="truncate text-sm text-neutral-200">{activeFileName}</span>
+              </div>
+              <span className="shrink-0 text-xs text-neutral-500">Processing…</span>
+            </div>
+          </div>
+        ) : (
+          <div className="relative">
+            <div className={(!selectedLanguage || !modelReady) ? "pointer-events-none opacity-40" : ""}>
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-400">
+                {modelReady ? "Step 2" : "Step 3"} — Upload your audio file
+              </p>
+              <UploadDropzone onFileSelected={handleFileSelected} />
+            </div>
+            {(!selectedLanguage || !modelReady) && (
+              <div
+                className="absolute inset-0 cursor-pointer"
+                onClick={() => {
+                  if (!selectedLanguage) { setIsLangShaking(true); setIsLangMenuOpen(true); }
+                  if (!modelReady) { setIsModelShaking(true); }
+                }}
+              />
+            )}
+          </div>
+        )}
+
+        {isWarmingUp ? (
+          <div className="mt-3 rounded-xl border border-cyan-500/20 bg-neutral-950/60 p-4 shadow-inner">
+            {/* Header row */}
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-0.5">
+                <p className="text-sm font-semibold text-neutral-100">
+                  Transcription in progress
+                </p>
+                <p className="text-xs text-neutral-400">
+                  Initial segment processing — the GPU is warming up. This takes 30–90 s the first time.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={cancelTranscription}
+                disabled={isCancelling}
+                className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Square className="size-3.5" />
+                {isCancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            </div>
+
+            {/* Stats row */}
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-xs font-medium tabular-nums text-cyan-300">
+                <Clock3 className="size-3.5" style={{ animationDuration: "3s" }} />
+                {warmUpElapsed}s elapsed
+              </span>
+
+              {totalSlices !== null && totalSlices > 1 && currentSlice !== null ? (
+                <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-400">
+                  Slice {currentSlice} / {totalSlices}
+                </span>
+              ) : null}
+
+              {totalChunks !== null ? (
+                <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-400">
+                  0 / {totalChunks} segments
+                </span>
+              ) : null}
+
+              {roughAudioMinutes !== null ? (
+                <span className="inline-flex items-center rounded-md border border-white/10 bg-neutral-800/60 px-2.5 py-1 text-xs text-neutral-500">
+                  ~{roughAudioMinutes} min audio
+                </span>
+              ) : null}
+            </div>
+
+            {/* Activity bar */}
+            <div className="mt-3 h-1 overflow-hidden rounded-full bg-neutral-800">
+              <div className="h-full w-full animate-[shimmer_1.5s_ease-in-out_infinite] rounded-full bg-gradient-to-r from-cyan-600/50 via-cyan-400 to-cyan-600/50 bg-[length:200%_100%]" />
+            </div>
+
+            <p className="mt-2 text-xs text-neutral-600">
+              Keep this tab active while processing.
+            </p>
+          </div>
+        ) : null}
+
+        {showProgressBar ? (
+          <div className="mt-3 space-y-2.5 rounded-xl border border-white/10 bg-neutral-950/70 p-3">
+            {/* ── Top row: label + cancel ─────────────────────────────────── */}
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-xs font-medium text-neutral-200 sm:text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>{progressLabel}</p>
+              <button
+                type="button"
+                onClick={cancelTranscription}
+                disabled={isCancelling}
+                className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Square className="size-3.5" />
+                {isCancelling ? "Cancelling..." : "Cancel"}
+              </button>
+            </div>
+
+            {/* ── Progress bar ────────────────────────────────────────────── */}
+            <div className="h-2 overflow-hidden rounded-full border border-white/10 bg-neutral-900/90">
+              <div
+                className="h-full rounded-full bg-cyan-400 transition-all duration-300"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+
+            {/* ── Slice pip track (only when there are multiple slices) ───── */}
+            {totalSlices !== null && totalSlices > 1 ? (
+              <div className="flex items-center gap-1">
+                {Array.from({ length: totalSlices }).map((_, i) => (
+                  <div
+                    key={i}
+                    className={[
+                      "h-1 flex-1 rounded-full transition-colors duration-300",
+                      currentSlice !== null && i < currentSlice
+                        ? "bg-cyan-400"
+                        : currentSlice !== null && i === currentSlice - 1
+                          ? "bg-cyan-400/60"
+                          : "bg-neutral-700",
+                    ].join(" ")}
+                  />
+                ))}
               </div>
             ) : null}
 
-            {error ? (
-              <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
-                <AlertCircle className="size-4" />
-                <span>{error}</span>
-              </div>
+            {/* ── ETA row ─────────────────────────────────────────────────── */}
+            {etaLabel ? (
+              <p className="text-xs text-neutral-500" style={{ fontVariantNumeric: "tabular-nums" }}>{etaLabel}</p>
             ) : null}
+          </div>
+        ) : null}
+
+        {status === "decoding" && !showProgressBar ? (
+          <div className="mt-3 flex items-center justify-between rounded-xl border border-white/10 bg-neutral-950/70 p-3">
+            <p className="text-xs text-neutral-300 sm:text-sm">Decoding audio...</p>
+            <button
+              type="button"
+              onClick={cancelTranscription}
+              disabled={isCancelling}
+              className="inline-flex items-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Square className="size-3.5" />
+              {isCancelling ? "Cancelling..." : "Cancel"}
+            </button>
+          </div>
+        ) : null}
+
+        {error ? (
+          <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            <AlertCircle className="size-4" />
+            <span>{error}</span>
+          </div>
+        ) : null}
 
         <div className={["mt-4 overflow-hidden rounded-xl border border-white/10 bg-neutral-950/75", justCompleted ? "transcript-flash" : ""].join(" ")}>
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-4 py-2">
@@ -1458,7 +1612,8 @@ export default function Home() {
         <div className="mt-4 rounded-lg border border-white/10 bg-neutral-950/70 px-3 py-2 text-xs text-neutral-400 sm:text-sm">
           Supports <span className="font-medium text-neutral-300">.mp3, .wav, .m4a, .mp4, .ogg, .flac, .aac, .webm, .opus</span>.
           Transcription runs in-browser with{" "}
-          <span className="font-medium text-neutral-300">Whisper Small</span>.
+          <span className="font-medium text-neutral-300">Whisper Small</span>
+          {isMobile ? <span> (on <span className="font-medium text-neutral-300">Groq API Whisper Large V3</span> via mobile fallback).</span> : "."}
           <br />
           <span className="mt-1 block text-amber-500/80">
             Do not refresh the page during transcription, or your progress will be lost.
@@ -1512,10 +1667,11 @@ export default function Home() {
               "priceCurrency": "USD"
             },
             "featureList": [
-              "100% Client-side processing",
-              "Privacy first - no data uploads",
+              "100% Client-side processing on Desktop",
+              "Blazing fast Cloud processing on Mobile",
+              "Privacy first - minimal data processing",
               "Supports multiple audio formats",
-              "High accuracy with Whisper Small",
+              "High accuracy with Whisper Small & Large V3",
               "Free to use"
             ]
           })
