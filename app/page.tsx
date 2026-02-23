@@ -168,6 +168,24 @@ async function decodeAudioFile(file: File): Promise<Float32Array> {
   }
 }
 
+async function decodeAudioFileForCloudChunking(file: File): Promise<{ samples: Float32Array; sampleRate: number }> {
+  const arrayBuffer = await file.arrayBuffer();
+  const AudioContextClass = window.AudioContext;
+  if (!AudioContextClass) {
+    throw new Error("Web Audio API is not supported in this browser.");
+  }
+
+  const audioContext = new AudioContextClass();
+  try {
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const mono = downmixToMono(audioBuffer);
+    const sampleRate = Math.max(8_000, Math.round(audioBuffer.sampleRate || 16_000));
+    return { samples: mono, sampleRate };
+  } finally {
+    await audioContext.close();
+  }
+}
+
 function encodeWAV(samples: Float32Array, sampleRate: number): Blob {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buffer);
@@ -686,6 +704,28 @@ export default function Home() {
         abortControllerRef.current = controller;
 
         try {
+          const transcribeCloudBlob = async (blob: Blob, chunkFileName: string) => {
+            const formData = new FormData();
+            formData.append("file", blob, chunkFileName);
+            if (selectedLanguage && selectedLanguage !== "auto") {
+              formData.append("language", selectedLanguage);
+            }
+
+            const response = await fetch("/api/transcribe", {
+              method: "POST",
+              body: formData,
+              signal: controller.signal,
+            });
+
+            if (!response.ok) {
+              const data = await response.json().catch(() => ({}));
+              const apiError = data?.error || "Cloud transcription failed.";
+              throw new Error(`HTTP ${response.status}: ${apiError}`);
+            }
+
+            return response.json();
+          };
+
           // Vercel serverless functions have a ~4.5 MB request body limit.
           // Files above 3 MB are decoded locally and sent as 60-second WAV
           // chunks (~1.9 MB each) to stay safely under that limit.
@@ -698,17 +738,18 @@ export default function Home() {
           } else {
             setLoadingDetail("Preparing audio for upload...");
             setStatus("decoding"); // visually update
-            const audioData = await decodeAudioFile(file);
+            const { samples: audioData, sampleRate } = await decodeAudioFileForCloudChunking(file);
+
             setStatus("transcribing"); // back to transcribing
 
-            // 60 s × 16000 Hz × 2 bytes = ~1.9 MB per chunk — safely under Vercel's 4.5 MB limit.
+            // 60 s WAV chunks are uploaded sequentially to stay under Vercel body limits.
             const CHUNK_DURATION_S = 60;
-            const SAMPLES_PER_CHUNK = CHUNK_DURATION_S * 16000;
+            const SAMPLES_PER_CHUNK = CHUNK_DURATION_S * sampleRate;
 
             for (let i = 0; i < audioData.length; i += SAMPLES_PER_CHUNK) {
               const chunkData = audioData.slice(i, i + SAMPLES_PER_CHUNK);
-              const wavBlob = encodeWAV(chunkData, 16000);
-              chunksToProcess.push({ blob: wavBlob, offsetS: i / 16000 });
+              const wavBlob = encodeWAV(chunkData, sampleRate);
+              chunksToProcess.push({ blob: wavBlob, offsetS: i / sampleRate });
             }
             setTotalChunks(chunksToProcess.length);
           }
@@ -724,26 +765,9 @@ export default function Home() {
             setProcessedChunks(i);
             setProgress((i / chunksToProcess.length) * 100);
 
-            const formData = new FormData();
-            formData.append("file", blob, `chunk-${i}.wav`);
-            if (selectedLanguage && selectedLanguage !== "auto") {
-              formData.append("language", selectedLanguage);
-            }
-
-            const response = await fetch("/api/transcribe", {
-              method: "POST",
-              body: formData,
-              signal: controller.signal,
-            });
-
-            if (!response.ok) {
-              const data = await response.json().catch(() => ({}));
-              throw new Error(data.error || "Cloud transcription failed.");
-            }
-
             if (requestId !== activeRequestIdRef.current) return;
 
-            const result = await response.json();
+            const result = await transcribeCloudBlob(blob, `chunk-${i}.wav`);
 
             combinedText += (combinedText ? " " : "") + (result.text || "").trim();
 
