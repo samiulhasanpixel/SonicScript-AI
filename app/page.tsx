@@ -686,19 +686,23 @@ export default function Home() {
         abortControllerRef.current = controller;
 
         try {
-          const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
+          // Vercel serverless functions have a ~4.5 MB request body limit.
+          // Files above 3 MB are decoded locally and sent as 60-second WAV
+          // chunks (~1.9 MB each) to stay safely under that limit.
+          const MAX_FILE_SIZE = 3 * 1024 * 1024; // 3 MB
           let chunksToProcess: { blob: Blob; offsetS: number }[] = [];
 
           if (file.size <= MAX_FILE_SIZE) {
             chunksToProcess = [{ blob: file, offsetS: 0 }];
             setTotalChunks(1);
           } else {
-            setLoadingDetail("File too large, chunking audio locally...");
+            setLoadingDetail("Preparing audio for upload...");
             setStatus("decoding"); // visually update
             const audioData = await decodeAudioFile(file);
             setStatus("transcribing"); // back to transcribing
 
-            const CHUNK_DURATION_S = 10 * 60; // 10 minutes
+            // 60 s × 16000 Hz × 2 bytes = ~1.9 MB per chunk — safely under Vercel's 4.5 MB limit.
+            const CHUNK_DURATION_S = 60;
             const SAMPLES_PER_CHUNK = CHUNK_DURATION_S * 16000;
 
             for (let i = 0; i < audioData.length; i += SAMPLES_PER_CHUNK) {
