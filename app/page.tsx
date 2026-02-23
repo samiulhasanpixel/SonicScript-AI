@@ -267,10 +267,17 @@ export default function Home() {
   const [isMobile, setIsMobile] = useState(false);
   const [gpuSupported, setGpuSupported] = useState(true);
   const [isViaCloud, setIsViaCloud] = useState(false);
+  // True if the model was successfully loaded in a previous session.
+  // Stored in localStorage so page refresh doesn't re-show the loading UI.
+  const [wasModelEverLoaded, setWasModelEverLoaded] = useState(false);
 
   useEffect(() => {
     setIsMobile(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
     setGpuSupported("gpu" in navigator);
+    // Check if model was loaded in a previous browser session.
+    if (typeof window !== "undefined" && localStorage.getItem("whisper_model_cached") === "1") {
+      setWasModelEverLoaded(true);
+    }
   }, []);
 
   // Kick off model preload as soon as the user picks a language.
@@ -348,6 +355,12 @@ export default function Home() {
           setTotalChunks(null);
           setEtaSeconds(null);
           transcribeStartedAtRef.current = null;
+          // Persist that the model has been loaded at least once so future
+          // page loads can suppress the brief loading UI on reinitialisation.
+          setWasModelEverLoaded(true);
+          if (typeof window !== "undefined") {
+            localStorage.setItem("whisper_model_cached", "1");
+          }
         } else if (message.status === "error") {
           setStatus("error");
           setLoadingDetail(null);
@@ -985,7 +998,14 @@ export default function Home() {
   // During model preloading (status === "loading", activeFileName === null) we keep the dropzone visible.
   const uploadBusy = busy && activeFileName !== null;
   /** True once the model pipeline is loaded and ready to transcribe. */
-  const modelReady = status === "ready" || status === "transcribing" || status === "decoding" || isMobile;
+  // Also treat as ready if model was previously cached AND we're only in the brief
+  // reinitialise phase (no actual download happening) — this hides the flash on page refresh.
+  const modelReady =
+    status === "ready" ||
+    status === "transcribing" ||
+    status === "decoding" ||
+    isMobile ||
+    (wasModelEverLoaded && status === "loading" && progressPhase !== "download");
   const isCompiling = status === "loading" && loadingDetail === "compiling";
   /** True between "transcribing" status and the very first chunk_callback firing. */
   const isWarmingUp =
